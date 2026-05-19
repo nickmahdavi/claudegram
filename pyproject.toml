@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudegram"
+version = "0.1.0"
+description = "Telegram bot bridging chats to Claude"
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40",
+    "python-telegram-bot>=22.0",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+claudegram = "claudegram.bot:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["claudegram*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
