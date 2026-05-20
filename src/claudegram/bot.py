@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from .importer import parse_export
 from .logging_config import setup_logging
 from .message import UTC, SYSTEM_PREFIX, Message, Reply, fmt_offset
-from .model import Claude
+from .model import Claude, ErrorClass, classify_error
 from .store import Store
 
 # Bot API caps document downloads at 20 MB
@@ -22,6 +22,57 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 
 # Discard pings older than
 STALE_PING_AGE_S = 60
+
+# User-facing replies for each error class. Plain, no personality, since this
+# lands in the chat where the failure happened and the user just wants to know
+# what's going on. Admin DMs get more color (see below).
+USER_ERROR_REPLIES: dict[ErrorClass, str] = {
+    ErrorClass.TRANSIENT: "Temporary issue talking to the API, try again in a sec.",
+    ErrorClass.CREDIT: "Out of API credits, the admin's been pinged.",
+    ErrorClass.AUTH: "API auth is broken, the admin's been pinged.",
+    ErrorClass.MODEL_NOT_FOUND: "That model isn't available. Try `/model clear` to revert to the default.",
+    ErrorClass.BAD_REQUEST: "The API didn't like the request shape, skipping this one.",
+    ErrorClass.UNKNOWN: "Hit something I don't recognize. Logged.",
+}
+
+# Admin DMs, with a bit of personality. Variables: {chat_id}, {count}, {desc}.
+# Use Markdown carefully -- avoid characters that need escaping mid-string.
+ADMIN_FAILURE_DMS: dict[ErrorClass, str] = {
+    ErrorClass.CREDIT: (
+        "heads up: {count} API errors in a row over in chat `{chat_id}`, "
+        "all looking like credit exhausted ({desc}). going quiet there to "
+        "avoid spamming the chat with the same complaint. ping me back once "
+        "the wallet's topped up."
+    ),
+    ErrorClass.AUTH: (
+        "{count} API auth errors in chat `{chat_id}` ({desc}). the key isn't "
+        "working, which is a you-problem from where i'm sitting. i'll keep "
+        "trying but won't be loud about it."
+    ),
+    ErrorClass.TRANSIENT: (
+        "{count} transient API errors in chat `{chat_id}` ({desc}). could be "
+        "anthropic having a moment, could be the network. SDK already retries "
+        "internally so this got past those. going to ride it out quietly."
+    ),
+    ErrorClass.MODEL_NOT_FOUND: (
+        "{count} model-not-found errors in chat `{chat_id}` ({desc}). someone "
+        "may have set a model via `/model` that doesn't exist anymore. "
+        "`/model clear` in that chat would reset it."
+    ),
+    ErrorClass.BAD_REQUEST: (
+        "{count} bad-request errors in chat `{chat_id}` ({desc}). the API "
+        "doesn't like the prompt shape. logs will have the full body."
+    ),
+    ErrorClass.UNKNOWN: (
+        "{count} unrecognized errors in chat `{chat_id}` ({desc}). no clue "
+        "what's up, logs are the place to look."
+    ),
+}
+
+ADMIN_RECOVERY_DM = (
+    "back online in chat `{chat_id}`. that streak was {count} failures deep "
+    "before the API started cooperating again. carrying on."
+)
 
 PathLike = Union[str, Path]
 Identity = tuple[str, str]  # (username, display_name)
@@ -203,10 +254,15 @@ class Bot:
                     self.store.get_user_tz,
                     partner_user_id,
                 )
-            except Exception:
-                logger.exception("Model error while completing for chat %s", message.chat_id)
-                await message.reply_text(f"{SYSTEM_PREFIX} Hit an error, couldn't reply")
+            except Exception as exc:
+                await self._handle_completion_error(message, exc)
                 return
+
+        # Successful completion -- clear any prior failure streak. If we'd
+        # alerted admins about the streak, also notify them it's recovered.
+        prior_failures = self.store.note_success(message.chat_id)
+        if prior_failures:
+            await self._notify_admins_recovered(message.chat_id, prior_failures)
 
         if not reply_text:
             logger.warning("Model returned empty reply for chat %s", message.chat_id)
@@ -243,6 +299,67 @@ class Bot:
     def _is_admin(self, update: Update) -> bool:
         user = update.effective_user
         return user is not None and user.id in self.admin_ids
+
+    async def _handle_completion_error(self, message, exc: Exception) -> None:
+        """Centralized response to an Anthropic API failure during on_ping.
+
+        Classifies the error, increments the per-chat failure counter,
+        decides whether to reply to the user (exponential backoff) and
+        whether to DM admins (one-shot per streak).
+        """
+        chat_id = message.chat_id
+        err_class, err_desc = classify_error(exc)
+        count = self.store.note_failure(chat_id)
+        logger.warning(
+            "Completion failed in chat %s (class=%s, desc=%s, consecutive=%d)",
+            chat_id, err_class.value, err_desc, count,
+            exc_info=exc,
+        )
+
+        if self.store.should_send_error_reply(chat_id):
+            user_text = USER_ERROR_REPLIES.get(err_class, USER_ERROR_REPLIES[ErrorClass.UNKNOWN])
+            try:
+                await message.reply_text(f"{SYSTEM_PREFIX} {user_text}")
+                self.store.mark_error_reply_sent(chat_id)
+            except Exception:
+                logger.exception("Failed to send error reply in chat %s", chat_id)
+
+        if self.store.should_alert_admin(chat_id):
+            await self._notify_admins_failure(chat_id, err_class, err_desc, count)
+            self.store.mark_admin_alerted(chat_id)
+
+    async def _notify_admins_failure(
+        self, chat_id: int, err_class: ErrorClass, err_desc: str, count: int,
+    ) -> None:
+        """DM each admin about a failure streak that just crossed the alert
+        threshold. Best-effort per-admin -- one admin's DM failing doesn't
+        block the others."""
+        if not self.admin_ids:
+            logger.warning(
+                "Failure streak in chat %s hit alert threshold, but no admins configured",
+                chat_id,
+            )
+            return
+        template = ADMIN_FAILURE_DMS.get(err_class, ADMIN_FAILURE_DMS[ErrorClass.UNKNOWN])
+        body = template.format(chat_id=chat_id, count=count, desc=err_desc)
+        text = f"{SYSTEM_PREFIX} {body}"
+        for admin_id in self.admin_ids:
+            try:
+                await self.app.bot.send_message(chat_id=admin_id, text=text, parse_mode="Markdown")
+            except Exception:
+                logger.exception("Failed to DM admin %s about failures in chat %s", admin_id, chat_id)
+
+    async def _notify_admins_recovered(self, chat_id: int, prior_count: int) -> None:
+        """DM admins that an alerted failure streak has cleared. Only fires
+        when note_success returned a nonzero count (i.e., we'd alerted)."""
+        if not self.admin_ids:
+            return
+        text = f"{SYSTEM_PREFIX} " + ADMIN_RECOVERY_DM.format(chat_id=chat_id, count=prior_count)
+        for admin_id in self.admin_ids:
+            try:
+                await self.app.bot.send_message(chat_id=admin_id, text=text, parse_mode="Markdown")
+            except Exception:
+                logger.exception("Failed to DM admin %s about recovery in chat %s", admin_id, chat_id)
 
     async def command_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message

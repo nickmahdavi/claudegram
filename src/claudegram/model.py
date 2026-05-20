@@ -1,5 +1,6 @@
 import logging
 from datetime import tzinfo
+from enum import Enum
 from typing import Callable, Optional
 from string import Template
 from zoneinfo import ZoneInfo
@@ -10,6 +11,56 @@ from anthropic.types import ModelParam, TextBlock
 from .message import UTC, Message, PromptMode, fmt_offset, render_history
 
 logger = logging.getLogger(__name__)
+
+
+class ErrorClass(Enum):
+    """Buckets for Anthropic API failures, used by the bot's error handling to
+    decide what to say to the user and the admin, and whether to back off.
+
+    TRANSIENT covers things worth retrying (rate limit, 5xx, connection drop).
+    The anthropic SDK already retries these internally a couple times, so by
+    the time we see them they're persistent enough to surface, just not
+    necessarily for-real-broken.
+    """
+    TRANSIENT = "transient"
+    CREDIT = "credit"
+    AUTH = "auth"
+    MODEL_NOT_FOUND = "model_not_found"
+    BAD_REQUEST = "bad_request"
+    UNKNOWN = "unknown"
+
+
+def classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
+    """Map an exception (typically from `anthropic.Client.messages.create`)
+    to a (class, short_human_description) pair. Description is one short
+    phrase suitable for logs and admin DMs, no period.
+    """
+    if isinstance(exc, anthropic.RateLimitError):
+        return ErrorClass.TRANSIENT, "rate limited (429)"
+    if isinstance(exc, anthropic.InternalServerError):
+        return ErrorClass.TRANSIENT, "anthropic 5xx"
+    if isinstance(exc, anthropic.APIConnectionError):
+        return ErrorClass.TRANSIENT, "connection failure"
+    if isinstance(exc, anthropic.AuthenticationError):
+        return ErrorClass.AUTH, "auth failure (bad/expired key)"
+    if isinstance(exc, anthropic.PermissionDeniedError):
+        return ErrorClass.AUTH, "permission denied"
+    if isinstance(exc, anthropic.NotFoundError):
+        return ErrorClass.MODEL_NOT_FOUND, "model not found"
+    if isinstance(exc, anthropic.BadRequestError):
+        # Anthropic surfaces "out of credit" / "billing" as 400 BadRequest with
+        # a typed message; sniff the text since the SDK doesnt give us a
+        # dedicated exception class for it.
+        msg = str(exc).lower()
+        if any(k in msg for k in ("credit balance", "billing", "quota", "your credit")):
+            return ErrorClass.CREDIT, "credit balance exhausted"
+        return ErrorClass.BAD_REQUEST, f"bad request: {str(exc)[:120]}"
+    if isinstance(exc, anthropic.UnprocessableEntityError):
+        return ErrorClass.BAD_REQUEST, "unprocessable entity"
+    if isinstance(exc, anthropic.APIError):
+        # Catch-all for any other anthropic.* error we havent enumerated.
+        return ErrorClass.UNKNOWN, f"anthropic api error: {type(exc).__name__}"
+    return ErrorClass.UNKNOWN, type(exc).__name__
 
 
 class Claude:
@@ -166,12 +217,21 @@ class Claude:
         text = "".join(text_parts)
         block_types = [getattr(b, "type", "?") for b in response.content]
         usage = response.usage
+        cache_write = usage.cache_creation_input_tokens or 0
+        cache_read = usage.cache_read_input_tokens or 0
+        actual_input = usage.input_tokens + cache_write + cache_read
+        # Heuristic check: window_tokens is len//4+5 per message; compare to the
+        # API's actual count so we can see how far off the estimate runs.
+        # Ratio >1 means the heuristic undercounts (real input larger than we
+        # think) — relevant for both TOKEN_BUDGET tuning and eviction sizing.
+        ratio = actual_input / window_tokens if window_tokens else float("nan")
+        logger.info(
+            "Token usage: estimated=%d actual=%d (ratio=%.2f) [uncached=%d cache_write=%d cache_read=%d output=%d]",
+            window_tokens, actual_input, ratio,
+            usage.input_tokens, cache_write, cache_read, usage.output_tokens,
+        )
         logger.debug(
-            "Completion response: %d chars from %d text block(s) of %d total (types=%s) usage: input=%d cache_write=%d cache_read=%d output=%d",
+            "Completion response: %d chars from %d text block(s) of %d total (types=%s)",
             len(text), len(text_parts), len(response.content), block_types,
-            usage.input_tokens,
-            usage.cache_creation_input_tokens or 0,
-            usage.cache_read_input_tokens or 0,
-            usage.output_tokens,
         )
         return text

@@ -38,6 +38,7 @@
 - [ ] interest meter or reply on random, either haiku or a subagent
 - [ ] rate limiting
 - [ ] reminders
+- [ ] options to keep disjoint conversational threads
 
 ### model handling
 

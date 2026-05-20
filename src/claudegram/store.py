@@ -34,6 +34,16 @@ class Store:
 
         self._last_load_at: dict[int, datetime] = {}
 
+        # Per-chat API-failure state. In-memory only, resets on restart.
+        # `_failure_counts`: consecutive failed completions in this chat.
+        # `_last_error_reply_at`: when we last spoke up to the user about a
+        #   failure, used for exponential backoff of those replies.
+        # `_admin_alerted`: True once we've DM'd admins about this streak,
+        #   so we don't re-DM on every subsequent failure in the same streak.
+        self._failure_counts: dict[int, int] = {}
+        self._last_error_reply_at: dict[int, datetime] = {}
+        self._admin_alerted: dict[int, bool] = {}
+
     def __repr__(self) -> str:
         return (
             f"Store(data_dir={self.data_dir}, log_dir={self.log_dir}, "
@@ -234,6 +244,74 @@ class Store:
 
     def mark_loaded(self, chat_id: int) -> None:
         self._last_load_at[chat_id] = datetime.now(timezone.utc)
+
+    # ---- API-failure tracking -------------------------------------------
+
+    # After this many consecutive failures in a chat, DM the admins. Once.
+    ADMIN_ALERT_THRESHOLD: int = 3
+    # Cap on the exponential backoff between user-facing error replies (sec).
+    # 30 min means we'll still occasionally surface "still broken" to whoever
+    # was pinging the chat, but not multiple times a minute during an outage.
+    ERROR_REPLY_BACKOFF_CAP_S: int = 1800
+
+    def get_failure_count(self, chat_id: int) -> int:
+        return self._failure_counts.get(chat_id, 0)
+
+    def note_failure(self, chat_id: int) -> int:
+        """Increment the per-chat consecutive-failure counter. Returns the
+        new count. Callers should follow up with `should_send_error_reply`
+        and `should_alert_admin` to decide what to do about it."""
+        self._failure_counts[chat_id] = self._failure_counts.get(chat_id, 0) + 1
+        return self._failure_counts[chat_id]
+
+    def note_success(self, chat_id: int) -> int:
+        """Mark a successful completion in this chat. Clears all failure
+        state. Returns the count of failures we'd accumulated IF the streak
+        had reached admin-alert territory (so callers can announce recovery
+        to admins); zero otherwise.
+        """
+        count = self._failure_counts.pop(chat_id, 0)
+        self._last_error_reply_at.pop(chat_id, None)
+        was_alerted = self._admin_alerted.pop(chat_id, False)
+        return count if was_alerted else 0
+
+    def should_send_error_reply(self, chat_id: int) -> bool:
+        """Exponential-backoff gate on user-facing "I'm broken" replies.
+
+        First failure: always reply. Subsequent failures: reply only if it's
+        been at least 2^(count-1) seconds since the last error reply we sent
+        in this chat, capped at ERROR_REPLY_BACKOFF_CAP_S. Cooldown is on
+        the OUTBOUND reply, not the API call (the SDK does its own retries
+        internally).
+        """
+        count = self._failure_counts.get(chat_id, 0)
+        if count <= 1:
+            return True
+        last = self._last_error_reply_at.get(chat_id)
+        if last is None:
+            # We have a streak but haven't replied yet in it (e.g., the
+            # initial replies were rate-limited away). Speak up.
+            return True
+        cooldown_s = min(2 ** (count - 1), self.ERROR_REPLY_BACKOFF_CAP_S)
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return elapsed >= cooldown_s
+
+    def mark_error_reply_sent(self, chat_id: int) -> None:
+        """Record that we just sent a user-facing error reply, so the next
+        `should_send_error_reply` call uses this as the cooldown anchor."""
+        self._last_error_reply_at[chat_id] = datetime.now(timezone.utc)
+
+    def should_alert_admin(self, chat_id: int) -> bool:
+        """True iff this chat has hit ADMIN_ALERT_THRESHOLD consecutive
+        failures AND we haven't already alerted on this streak."""
+        if self._admin_alerted.get(chat_id):
+            return False
+        return self._failure_counts.get(chat_id, 0) >= self.ADMIN_ALERT_THRESHOLD
+
+    def mark_admin_alerted(self, chat_id: int) -> None:
+        """Record that we just DM'd the admins about this chat's failure
+        streak. Cleared on the next `note_success`."""
+        self._admin_alerted[chat_id] = True
 
     def replace_chat(self, chat_id: int, messages: list[Message]) -> Path:
         path = self.chat_path(chat_id)
