@@ -557,6 +557,20 @@ class Bot:
                     )
                     return
 
+                # Seed display names recovered from the export so imported
+                # history renders with real names rather than the "User <id>"
+                # fallback. Only for users we don't already know: live data
+                # (real @handles, timezones) must win over the export's
+                # name-only, placeholder-handle identities.
+                seeded = 0
+                for uid, uinfo in result.users.items():
+                    if self.store.get_user(uid) is None:
+                        self.store.note_user(uinfo)
+                        seeded += 1
+                if seeded:
+                    logger.info("Seeded %d new user identit%s from import for chat %s",
+                                seeded, "y" if seeded == 1 else "ies", chat_id)
+
                 backup = self.store.replace_chat(chat_id, result.messages)
                 self.store.mark_loaded(chat_id)
             except Exception as e:

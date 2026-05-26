@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -23,6 +23,12 @@ class ImportResult:
     dropped_commands: int = 0
     dropped_service: int = 0
     dropped_non_text: int = 0
+    # Identities recovered from the export, keyed by user_id. Telegram Desktop
+    # exports carry a display name ("from") but no @handle, so username is a
+    # placeholder. The bot seeds these into the store for users it doesn't
+    # already know, so imported history renders with real names instead of the
+    # "User <id>" fallback (live messages still take precedence; see note_user).
+    users: dict[int, UserInfo] = field(default_factory=dict)
 
     @property
     def kept(self) -> int:
@@ -138,6 +144,17 @@ def parse_export(
             result.dropped_non_text += 1
             continue
 
+        # Record identity only once the message has cleared every drop filter,
+        # so result.users stays exactly the set of participants present in the
+        # kept history (no orphans for users whose messages were all dropped).
+        if user_id not in result.users:
+            from_name = m.get("from")
+            result.users[user_id] = UserInfo(
+                user_id=user_id,
+                username=f"user_{user_id}",
+                display_name=from_name if isinstance(from_name, str) and from_name.strip() else f"user_{user_id}",
+            )
+
         reply_to_raw = m.get("reply_to_message_id")
         reply_to = reply_to_raw if isinstance(reply_to_raw, int) else None
 
@@ -167,9 +184,9 @@ def parse_export(
 
     result.messages = ordered
     logger.info(
-        "Parsed export %s: kept=%d total=%d dropped_system=%d dropped_commands=%d "
+        "Parsed export %s: kept=%d total=%d users=%d dropped_system=%d dropped_commands=%d "
         "dropped_service=%d dropped_non_text=%d",
-        path, result.kept, result.total,
+        path, result.kept, result.total, len(result.users),
         result.dropped_system, result.dropped_commands,
         result.dropped_service, result.dropped_non_text,
     )
