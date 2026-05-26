@@ -11,10 +11,11 @@ dependencies = [
     "anthropic>=0.40",
     "python-telegram-bot>=22.0",
     "python-dotenv>=1.0",
+    "pydantic-settings>=2.14.1",
 ]
 
 [project.scripts]
-claudegram = "claudegram.bot:main"
+claudegram = "claudegram.__main__:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

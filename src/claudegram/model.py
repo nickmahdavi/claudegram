@@ -1,237 +1,172 @@
+from __future__ import annotations
+
 import logging
-from datetime import tzinfo
-from enum import Enum
-from typing import Callable, Optional
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Optional
 from string import Template
-from zoneinfo import ZoneInfo
 
-import anthropic
-from anthropic.types import ModelParam, TextBlock
+from anthropic import AsyncClient
+from anthropic.types import (
+    CacheControlEphemeralParam,
+    MessageParam,
+    ModelParam,
+    TextBlock,
+    TextBlockParam,
+)
 
-from .message import UTC, Message, PromptMode, fmt_offset, render_history
+from .identity import UserInfo
 
 logger = logging.getLogger(__name__)
 
 
-class ErrorClass(Enum):
-    """Buckets for Anthropic API failures, used by the bot's error handling to
-    decide what to say to the user and the admin, and whether to back off.
+@dataclass
+class ClaudeResponse:
+    text: str
+    input_tokens: int
+    cache_read: int
+    cache_write: int
+    output_tokens: int
+    block_count: int
+    block_types: list[str]
+    true_input: int = field(init=False)
 
-    TRANSIENT covers things worth retrying (rate limit, 5xx, connection drop).
-    The anthropic SDK already retries these internally a couple times, so by
-    the time we see them they're persistent enough to surface, just not
-    necessarily for-real-broken.
-    """
-    TRANSIENT = "transient"
-    CREDIT = "credit"
-    AUTH = "auth"
-    MODEL_NOT_FOUND = "model_not_found"
-    BAD_REQUEST = "bad_request"
-    UNKNOWN = "unknown"
+    def __post_init__(self):
+        self.true_input = self.input_tokens + self.cache_read + self.cache_write
 
+class Model(StrEnum):
+    OPUS_4_7 = "claude-opus-4-7"
+    OPUS_4_6 = "claude-opus-4-6"
+    OPUS_4_5 = "claude-opus-4-5"
+    OPUS_4_1 = "claude-opus-4-1"
+    OPUS_4_0 = "claude-opus-4-0"
+    SONNET_4_6 = "claude-sonnet-4-6"
+    SONNET_4_5 = "claude-sonnet-4-5"
+    SONNET_4_0 = "claude-sonnet-4-0"
+    HAIKU_4_5 = "claude-haiku-4-5"
 
-def classify_error(exc: BaseException) -> tuple[ErrorClass, str]:
-    """Map an exception (typically from `anthropic.Client.messages.create`)
-    to a (class, short_human_description) pair. Description is one short
-    phrase suitable for logs and admin DMs, no period.
-    """
-    if isinstance(exc, anthropic.RateLimitError):
-        return ErrorClass.TRANSIENT, "rate limited (429)"
-    if isinstance(exc, anthropic.InternalServerError):
-        return ErrorClass.TRANSIENT, "anthropic 5xx"
-    if isinstance(exc, anthropic.APIConnectionError):
-        return ErrorClass.TRANSIENT, "connection failure"
-    if isinstance(exc, anthropic.AuthenticationError):
-        return ErrorClass.AUTH, "auth failure (bad/expired key)"
-    if isinstance(exc, anthropic.PermissionDeniedError):
-        return ErrorClass.AUTH, "permission denied"
-    if isinstance(exc, anthropic.NotFoundError):
-        return ErrorClass.MODEL_NOT_FOUND, "model not found"
-    if isinstance(exc, anthropic.BadRequestError):
-        # Anthropic surfaces "out of credit" / "billing" as 400 BadRequest with
-        # a typed message; sniff the text since the SDK doesnt give us a
-        # dedicated exception class for it.
-        msg = str(exc).lower()
-        if any(k in msg for k in ("credit balance", "billing", "quota", "your credit")):
-            return ErrorClass.CREDIT, "credit balance exhausted"
-        return ErrorClass.BAD_REQUEST, f"bad request: {str(exc)[:120]}"
-    if isinstance(exc, anthropic.UnprocessableEntityError):
-        return ErrorClass.BAD_REQUEST, "unprocessable entity"
-    if isinstance(exc, anthropic.APIError):
-        # Catch-all for any other anthropic.* error we havent enumerated.
-        return ErrorClass.UNKNOWN, f"anthropic api error: {type(exc).__name__}"
-    return ErrorClass.UNKNOWN, type(exc).__name__
+class PromptMode(StrEnum):
+    PREFILL = "prefill"
+    CHAT = "chat"
+    CHAT_PRIVATE = "chat_private"
+
+NO_PREFILL = (Model.OPUS_4_7, Model.OPUS_4_6, Model.SONNET_4_6, Model.HAIKU_4_5)
+
+SUPPORTED_MODELS = frozenset(Model)
+
+MODEL_ALIASES: dict[str, Model] = {
+    "op4.7": Model.OPUS_4_7,
+    "op4.6": Model.OPUS_4_6,
+    "op4.5": Model.OPUS_4_5,
+    "op4.0": Model.OPUS_4_0,
+    "op4": Model.OPUS_4_0,
+    "s4.6": Model.SONNET_4_6,
+    "s4.5": Model.SONNET_4_5,
+    "s4.0": Model.SONNET_4_0,
+    "s4": Model.SONNET_4_0,
+    "h4.5": Model.HAIKU_4_5,
+}
 
 
-class Claude:
-    NO_PREFILL = ("claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5")
-
-    KNOWN_MODELS = frozenset({
-        "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1", "claude-opus-4-0",
-        "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4-0",
-        "claude-haiku-4-5",
-    })
-
-    MODEL_ALIASES: dict[str, str] = {
-        "op4.7": "claude-opus-4-7",
-        "op4.6": "claude-opus-4-6",
-        "op4.5": "claude-opus-4-5",
-        "op4.0": "claude-opus-4-1",
-        "op4": "claude-opus-4-0",
-        "s4.6": "claude-sonnet-4-6",
-        "s4.5": "claude-sonnet-4-5",
-        "s4.0": "claude-sonnet-4-0",
-        "s4": "claude-sonnet-4-0",
-        "h4.5": "claude-haiku-4-5",
-    }
-
-    SYSTEM_PROMPTS = {
-        "prefill": "The assistant is in CLI simulation mode, and responds to the user's CLI commands only with outputs of the commands.",
-        "chat": "You're an LLM in a group conversation. Messages from other participants are prefixed with their name + handle + UTC time + offset suffix (e.g. '14:32 +00'). You should just send your messages like normal (no prefix).\nYour display name is $display_name, and your username is $username. Users might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name.\n$user_tz_directory\nHave fun!",
-        "chat_private": "You're an LLM in a private (1:1) conversation with $partner_display_name (@$partner_username). Their messages appear in human / user turns prefixed with their name + handle + local time + offset suffix (e.g. '14:32 -04'). Timestamps are rendered in their timezone ($partner_tz). You should just send your messages like normal (no prefix).\nYour display name is $display_name, and your username is $username. They might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name. Have fun!",
-    }
-
-    def __init__(self, api_key: str, model: ModelParam, max_tokens: int):
-        self.client = anthropic.Client(api_key=api_key)
-        self._max_tokens = max_tokens
-        self._model = model # default
-        logger.info("Claude initialized: default_model=%s max_tokens=%d", model, max_tokens)
-
-    def __repr__(self) -> str:
-        return f"Claude(default_model={self._model!r}, max_tokens={self._max_tokens})"
-
-    @property
-    def model(self) -> str:
-        return str(self._model)
-
-    @classmethod
-    def mode_for(cls, model: str) -> PromptMode:
-        # Prefill mode is disabled until stop seqence detection is fixed
-        return "chat"
-        # return "chat" if model in cls.NO_PREFILL else "prefill"
-
-    @staticmethod
-    def _build_tz_directory(
-        messages: list[Message],
-        tz_lookup: Optional[Callable[[int], Optional[str]]],
-    ) -> tuple[str, int]:
-        if tz_lookup is None:
-            return "", 0
-
-        seen: dict[int, tuple[str, str]] = {}  # user_id -> (handle, display_name)
-        for m in messages:
-            if m.user_id is None:
-                continue
-            if m.user_id in seen:
-                continue
-            seen[m.user_id] = (m.username, m.display_name)
-
-        if not seen:
-            return "", 0
-
-        known: list[tuple[int, str, str, str]] = []  # (user_id, handle, tz_name, offset)
-        unknown: list[tuple[int, str]] = []  # (user_id, handle)
-        for uid in sorted(seen):
-            handle, _ = seen[uid]
-            tz_name = tz_lookup(uid)
-            if tz_name:
-                try:
-                    known.append((uid, handle, tz_name, fmt_offset(ZoneInfo(tz_name))))
-                except Exception:
-                    unknown.append((uid, handle))
-            else:
-                unknown.append((uid, handle))
-
-        lines = ["User timezone directory (UTC offsets in message tags; convert as needed):"]
-        for uid, handle, tz_name, off in known:
-            lines.append(f"  @{handle} (id={uid}) — {tz_name} ({off})")
-        for uid, handle in unknown:
-            lines.append(f"  @{handle} (id={uid}) — unset (00?), treat as UTC")
-        return "\n".join(lines), len(known) + len(unknown)
-
-    def complete(
-        self,
-        messages: list[Message],
-        window_tokens: int,
-        username: str,
-        display_name: str,
-        model: Optional[ModelParam] = None,
-        max_tokens: Optional[int] = None,
-        is_private: bool = False,
-        partner: Optional[tuple[str, str]] = None,
-        tz_lookup: Optional[Callable[[int], Optional[str]]] = None,
-        partner_user_id: Optional[int] = None,
+def get_prompt(
+    prompt_template: Template,
+    model: Model | str,
+    bot_info: UserInfo,
+    partner: Optional[UserInfo] = None,
+    tz_directory: Optional[str] = None  #, **kwargs for user-defined prompt vars
     ) -> str:
-        m = model or self._model
-        if m not in self.KNOWN_MODELS:
-            raise ValueError(f"unknown model: {m!r}. known: {sorted(self.KNOWN_MODELS)}")
 
-        mode = self.mode_for(m)
+    # some redundancy here
+    # also will need to be reworked when we decide to properly handle unknown users
+    partner_display_name = partner.display_name if partner else "Unknown"
+    partner_username = partner.username if partner else "unknown"
+    if partner and not partner.tz:
+        logger.debug("No partner tz for private chat; using UTC")
+    partner_tz = partner.tz.key if partner and partner.tz else 'UTC'
+    user_tz_directory = tz_directory or ""
 
-        display_tz: tzinfo = UTC
-        partner_tz_name = "UTC"
-        if mode == "chat" and is_private and partner_user_id is not None and tz_lookup is not None:
-            tz_name = tz_lookup(partner_user_id)
-            if tz_name:
-                try:
-                    display_tz = ZoneInfo(tz_name)
-                    partner_tz_name = tz_name
-                except Exception:
-                    logger.warning("Bad tz %r for partner %s; falling back to UTC", tz_name, partner_user_id)
+    return prompt_template.safe_substitute(
+        display_name=bot_info.display_name,
+        username=bot_info.username,
+        model_name=model,
+        partner_display_name=partner_display_name,
+        partner_username=partner_username,
+        partner_tz=partner_tz,
+        user_tz_directory=user_tz_directory,
+    )
 
-        template_key = "chat_private" if (mode == "chat" and is_private) else mode
-        template = Template(self.SYSTEM_PROMPTS.get(template_key, ""))
-        partner_username, partner_display_name = partner if partner else ("", "")
+_EPHEMERAL: CacheControlEphemeralParam = {"type": "ephemeral"}
 
-        if mode == "chat" and not is_private:
-            user_tz_directory, dir_users = self._build_tz_directory(messages, tz_lookup)
-        else:
-            user_tz_directory, dir_users = "", 0
 
-        system = template.safe_substitute(
-            display_name=display_name,
-            username=username,
-            model_name=m,
-            partner_username=partner_username,
-            partner_display_name=partner_display_name,
-            partner_tz=partner_tz_name,
-            user_tz_directory=user_tz_directory,
-        )
+def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessageParam]:
+    """Return a shallow copy of `messages` with cache_control marked on the
+    last block of the last message. Required because Anthropic's prompt cache
+    is content-prefix-addressed: a hit requires the prefix up to a marker to
+    be byte-identical to a prior request. Marking the tail caches the entire
+    history+system through the user's latest turn, which subsequent calls
+    will hit as long as Window's eviction policy hasn't shifted the prefix
+    (see Window.EVICT_TARGET)."""
+    if not messages:
+        return messages
+    out = list(messages)
+    last = dict(out[-1])
+    content = last.get("content")
+    if isinstance(content, str):
+        blocks: list[TextBlockParam] = [
+            {"type": "text", "text": content, "cache_control": _EPHEMERAL}
+        ]
+        last["content"] = blocks
+    elif isinstance(content, list) and content:
+        new_blocks = list(content)
+        tail = dict(new_blocks[-1])
+        tail["cache_control"] = _EPHEMERAL
+        new_blocks[-1] = tail  # type: ignore[assignment]
+        last["content"] = new_blocks
+    out[-1] = last  # type: ignore[assignment]
+    return out
 
-        rendered = render_history(messages, username, mode, display_tz=display_tz)
-        logger.debug(
-            "Completion request: model=%s mode=%s template=%s message_turns=%d window_tokens=%d display_tz=%s dir_users=%d",
-            m, mode, template_key, len(rendered), window_tokens,
-            getattr(display_tz, "key", str(display_tz)),
-            dir_users,
-        )
-        response = self.client.messages.create(
-            model=m,
-            system=system,
-            max_tokens=max_tokens or self._max_tokens,
-            messages=rendered,
-            cache_control={"type": "ephemeral"},
-        )
 
-        text_parts = [b.text for b in response.content if isinstance(b, TextBlock)]
-        text = "".join(text_parts)
-        block_types = [getattr(b, "type", "?") for b in response.content]
-        usage = response.usage
-        cache_write = usage.cache_creation_input_tokens or 0
-        cache_read = usage.cache_read_input_tokens or 0
-        actual_input = usage.input_tokens + cache_write + cache_read
-        # Heuristic check: window_tokens is len//4+5 per message; compare to the
-        # API's actual count so we can see how far off the estimate runs.
-        # Ratio >1 means the heuristic undercounts (real input larger than we
-        # think) — relevant for both TOKEN_BUDGET tuning and eviction sizing.
-        ratio = actual_input / window_tokens if window_tokens else float("nan")
-        logger.info(
-            "Token usage: estimated=%d actual=%d (ratio=%.2f) [uncached=%d cache_write=%d cache_read=%d output=%d]",
-            window_tokens, actual_input, ratio,
-            usage.input_tokens, cache_write, cache_read, usage.output_tokens,
-        )
-        logger.debug(
-            "Completion response: %d chars from %d text block(s) of %d total (types=%s)",
-            len(text), len(text_parts), len(response.content), block_types,
-        )
-        return text
+async def complete(client: AsyncClient, model: ModelParam, system: str, messages: list[MessageParam], max_tokens: int) -> ClaudeResponse:
+    # Two explicit cache breakpoints, used together:
+    #   1. End of the system prompt: small always-on cache. Survives Window
+    #      evictions (system content is independent of the working set as long
+    #      as build_tz_directory is fed Window.known_users() rather than the
+    #      snapshot). For DMs the system prompt may be under the per-model
+    #      minimum-cacheable-size, in which case this marker is silently
+    #      dropped -- harmless.
+    #   2. End of the last message: caches the full conversation prefix.
+    #      Hits during a burst of pings within the 5-min TTL, until Window
+    #      evicts and the prefix shifts.
+    # Replaces the top-level `cache_control={"type":"ephemeral"}` kwarg, which
+    # placed only the second marker and lost the system-prompt cache.
+    system_blocks: list[TextBlockParam] = [
+        {"type": "text", "text": system, "cache_control": _EPHEMERAL}
+    ]
+    cached_messages = _mark_last_message_for_cache(messages)
+
+    response = await client.messages.create(
+        model=model,
+        system=system_blocks,
+        messages=cached_messages,
+        max_tokens=max_tokens,
+    )
+
+    text_parts = [b.text for b in response.content if isinstance(b, TextBlock)]
+    text = "".join(text_parts)
+    block_types = [getattr(b, "type", "?") for b in response.content]
+    usage = response.usage
+
+    logger.debug(
+        "Completion response: %d chars from %d text block(s) of %d total (types=%s)",
+        len(text), len(text_parts), len(response.content), block_types
+    )
+    
+    return ClaudeResponse(
+        text=text,
+        input_tokens=usage.input_tokens,
+        cache_write=usage.cache_creation_input_tokens or 0,
+        cache_read=usage.cache_read_input_tokens or 0,
+        output_tokens=usage.output_tokens,
+        block_count=len(text_parts),
+        block_types=block_types
+    )

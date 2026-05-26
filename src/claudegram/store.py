@@ -3,10 +3,13 @@ import json
 import logging
 import os
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union
 
+from .identity import UserInfo
+from .model import Model
 from .message import Message, Window
 
 PathLike = Union[str, Path]
@@ -21,35 +24,34 @@ class Store:
         self.input_budget = input_budget
         self.windows: dict[int, Window] = {}
 
-        self._model_prefs: dict[int, str] = {}
+        self._model_prefs: dict[int, Model] = {}
         self._load_model_prefs()
 
         self._active_chats: set[int] = set()
         self._load_active_chats()
 
-        self._user_prefs: dict[int, dict] = {}
-        self._load_user_prefs()
+        self._users: dict[int, UserInfo] = {}
+        self._load_users()
 
         self._locks: dict[int, asyncio.Lock] = {}
 
         self._last_load_at: dict[int, datetime] = {}
 
-        # Per-chat API-failure state. In-memory only, resets on restart.
-        # `_failure_counts`: consecutive failed completions in this chat.
-        # `_last_error_reply_at`: when we last spoke up to the user about a
-        #   failure, used for exponential backoff of those replies.
-        # `_admin_alerted`: True once we've DM'd admins about this streak,
-        #   so we don't re-DM on every subsequent failure in the same streak.
         self._failure_counts: dict[int, int] = {}
         self._last_error_reply_at: dict[int, datetime] = {}
         self._admin_alerted: dict[int, bool] = {}
+
+        # Bumped whenever a chat's window is wiped (reset) or wholesale replaced (load),
+        # i.e. on a discontinuity in history. Slow in-flight completions should detect that the
+        # conversation it was answering no longer exists before persisting.
+        self._incarnation: dict[int, int] = {}
 
     def __repr__(self) -> str:
         return (
             f"Store(data_dir={self.data_dir}, log_dir={self.log_dir}, "
             f"input_budget={self.input_budget}, "
             f"[{len(self.windows)} chats, {len(self._model_prefs)} model prefs, "
-            f"{len(self._active_chats)} active, {len(self._user_prefs)} user prefs])"
+            f"{len(self._active_chats)} active, {len(self._users)} users])"
         )
 
     def window(self, chat_id: int) -> Window:
@@ -67,13 +69,16 @@ class Store:
     def model_prefs_path(self) -> Path:
         return self.data_dir / "model_prefs.json"
 
-    def get_model_pref(self, chat_id: int) -> Optional[str]:
+    def get_model_pref(self, chat_id: int) -> Optional[Model]:
+        # _model_prefs only ever holds valid Models: normalization happens in
+        # set_model_pref and bad on-disk entries are dropped in _load_model_prefs.
         return self._model_prefs.get(chat_id)
 
-    def set_model_pref(self, chat_id: int, model: str) -> None:
-        self._model_prefs[chat_id] = model
+    def set_model_pref(self, chat_id: int, model: Model | str) -> None:
+        resolved = model if isinstance(model, Model) else Model(model)  # raises on garbage
+        self._model_prefs[chat_id] = resolved
         self._save_model_prefs()
-        logger.info("Set model pref for chat %s: %s", chat_id, model)
+        logger.info("Set model pref for chat %s: %s", chat_id, resolved.value)
 
     def clear_model_pref(self, chat_id: int) -> bool:
         had = chat_id in self._model_prefs
@@ -90,18 +95,25 @@ class Store:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            self._model_prefs = {int(k): v for k, v in raw.items()}
-            logger.info("Loaded %d model pref(s) from %s", len(self._model_prefs), path)
         except Exception as e:
             logger.error("Failed to load model prefs from %s: %s — starting fresh", path, e, exc_info=True)
             self._model_prefs = {}
+            return
+        parsed: dict[int, Model] = {}
+        for k, v in raw.items():
+            try:
+                parsed[int(k)] = Model(v)
+            except (ValueError, TypeError) as e:
+                logger.warning("Dropping invalid model pref for chat %s: %r (%s)", k, v, e)
+        self._model_prefs = parsed
+        logger.info("Loaded %d model pref(s) from %s", len(self._model_prefs), path)
 
     def _save_model_prefs(self) -> None:
         path = self.model_prefs_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self._model_prefs.items()}, f, indent=2)
+            json.dump({str(k): v.value for k, v in self._model_prefs.items()}, f, indent=2)
         tmp.replace(path)
 
     @property
@@ -147,27 +159,7 @@ class Store:
     def users_path(self) -> Path:
         return self.data_dir / "users.json"
 
-    def get_user_tz(self, user_id: int) -> Optional[str]:
-        return self._user_prefs.get(user_id, {}).get("tz")
-
-    def set_user_tz(self, user_id: int, tz: str) -> None:
-        prefs = self._user_prefs.setdefault(user_id, {})
-        prefs["tz"] = tz
-        self._save_user_prefs()
-        logger.info("Set tz for user %s: %s", user_id, tz)
-
-    def clear_user_tz(self, user_id: int) -> bool:
-        prefs = self._user_prefs.get(user_id)
-        if not prefs or "tz" not in prefs:
-            return False
-        prefs.pop("tz", None)
-        if not prefs:
-            self._user_prefs.pop(user_id, None)
-        self._save_user_prefs()
-        logger.info("Cleared tz for user %s", user_id)
-        return True
-
-    def _load_user_prefs(self) -> None:
+    def _load_users(self) -> None:
         path = self.users_path
         if not path.exists():
             return
@@ -188,20 +180,74 @@ class Store:
                 uid = int(k)
                 if not isinstance(v, dict):
                     raise TypeError(f"expected dict, got {type(v).__name__}")
-                self._user_prefs[uid] = dict(v)
+                self._users[uid] = UserInfo.from_dict(v)
                 loaded += 1
             except Exception as e:
                 logger.warning("Skipping bad user pref entry %r: %s", k, e)
                 skipped += 1
         logger.info("Loaded %d user pref(s) from %s (skipped %d)", loaded, path, skipped)
 
-    def _save_user_prefs(self) -> None:
+    def _save_users(self) -> None:
         path = self.users_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in self._user_prefs.items()}, f, indent=2)
+            json.dump({str(k): v.to_dict() for k, v in self._users.items()}, f, indent=2)
         tmp.replace(path)
+
+    def clear_user_tz(self, user_id: int) -> bool:
+        user = self._users.get(user_id)
+        if not user or not user.tz:
+            return False
+        user.tz = None
+        self._save_users()
+        logger.info("Cleared tz for user %s", user_id)
+        return True
+    
+    def get_user(self, user_id: int) -> Optional[UserInfo]:
+        user_info = self._users.get(user_id)
+        return replace(user_info) if user_info else None
+    
+    def resolve_user(self, user_id: int) -> UserInfo:
+        user_info = self.get_user(user_id)
+        if user_info:
+            return user_info
+        return UserInfo(user_id=user_id, username=f"user_{user_id}", display_name=f"User {user_id}", tz=None)
+
+    def set_user(self, user_info: UserInfo):
+        # Unceremonious.
+        self._users[user_info.user_id] = replace(user_info)
+        self._save_users()
+        logger.debug("Set info for user %s: %s", user_info.user_id, user_info)
+    
+    def note_user(self, user_info: UserInfo) -> bool:
+        existing = self._users.get(user_info.user_id)
+        if existing is None:
+            self._users[user_info.user_id] = replace(user_info)
+            self._save_users()
+            logger.debug("Recorded new user %s: %s", user_info.user_id, user_info)
+            return True
+
+        # Only fields the caller actually supplied (truthy) can overwrite; never
+        # clobber stored info with blanks. tz unset goes through clear_user_tz.
+        changes = {
+            field: new
+            for field, new, old in (
+                ("username", user_info.username, existing.username),
+                ("display_name", user_info.display_name, existing.display_name),
+                ("tz", user_info.tz, existing.tz),
+            )
+            if new and new != old
+        }
+        if not changes:
+            logger.debug("No changes to persist for user %s", user_info.user_id)
+            return False
+
+        for field, new in changes.items():
+            setattr(existing, field, new)
+        self._save_users()
+        logger.debug("Updated user %s: %s", user_info.user_id, changes)
+        return True
 
     def load_chat(self, chat_id: int) -> Window:
         path = self.chat_path(chat_id)
@@ -230,7 +276,9 @@ class Store:
         return n
     
     def persist_all(self) -> list[int]:
-        return [self.persist(chat_id) for chat_id in self.windows]
+        # list() so a concurrent load_chat/reset mutating self.windows can't
+        # raise "dictionary changed size during iteration" at shutdown.
+        return [self.persist(chat_id) for chat_id in list(self.windows)]
 
     def lock(self, chat_id: int) -> asyncio.Lock:
         lock = self._locks.get(chat_id)
@@ -238,6 +286,13 @@ class Store:
             lock = asyncio.Lock()
             self._locks[chat_id] = lock
         return lock
+
+    def incarnation(self, chat_id: int) -> int:
+        """Opaque marker of the chat's current continuous history. Bumped only
+        on a discontinuity -- reset()/replace_chat() -- never on appends.
+        Snapshot it before a long await and re-check afterwards: if it changed,
+        the history was wiped/replaced out from under you."""
+        return self._incarnation.get(chat_id, 0)
 
     def get_last_load_at(self, chat_id: int) -> Optional[datetime]:
         return self._last_load_at.get(chat_id)
@@ -329,12 +384,14 @@ class Store:
         logger.info("Replaced chat %s history with %d message(s)", chat_id, len(messages))
 
         self.windows.pop(chat_id, None)
+        self._incarnation[chat_id] = self._incarnation.get(chat_id, 0) + 1
         return backup
 
     def reset(self, chat_id: int) -> tuple[bool, bool, bool]:
         deleted_window = bool(self.windows.pop(chat_id, None))
         if deleted_window:
             logger.info("Reset chat history for chat %s", chat_id)
+        self._incarnation[chat_id] = self._incarnation.get(chat_id, 0) + 1
 
         path = self.chat_path(chat_id)
         chat_exists = path.exists()

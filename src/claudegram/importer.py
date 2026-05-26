@@ -6,7 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .message import UTC, Message, Reply, SYSTEM_PREFIX
+from .identity import UserInfo
+
+from .message import UTC, Message, Reply
 
 _COMMAND_RE = re.compile(r"^\s*/\w+(@\w+)?(\s|$)")
 
@@ -85,11 +87,10 @@ def _photo_decorated(text: str, has_photo: bool) -> str:
 
 def parse_export(
     path: Path,
-    bot_user_id: int,
-    bot_username: str,
-    bot_display_name: str,
+    bot: UserInfo,
+    system_prefix: str
 ) -> ImportResult:
-    logger.info("Parsing export from %s (bot_user_id=%d)", path, bot_user_id)
+    logger.info("Parsing export from %s (bot_user_id=%d)", path, bot.user_id)
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
@@ -118,7 +119,7 @@ def parse_export(
             result.dropped_non_text += 1
             continue
 
-        if text.startswith(SYSTEM_PREFIX):
+        if text.startswith(system_prefix):
             result.dropped_system += 1
             continue
 
@@ -126,12 +127,6 @@ def parse_export(
         if user_id is None:
             result.dropped_non_text += 1
             continue
-
-        if user_id == bot_user_id:
-            username, display_name = bot_username, bot_display_name
-        else:
-            username = f"user_{user_id}"
-            display_name = m.get("from") or username
 
         ts = _parse_ts(m.get("date_unixtime"), m.get("date"))
         if ts is None:
@@ -149,12 +144,10 @@ def parse_export(
         msg = Message(
             id=msg_id,
             ts=ts,
-            username=username,
-            display_name=display_name,
+            user_id=user_id,
             text=text,
             reply_to=reply_to,
             reply=None,
-            user_id=user_id,
         )
         by_id[msg_id] = msg
         ordered.append(msg)
@@ -166,12 +159,10 @@ def parse_export(
         if parent is None:
             continue
         msg.reply = Reply(
-            display_name=parent.display_name,
-            username=parent.username,
+            user_id=parent.user_id,
             text=parent.text,
             is_quote=False,  # Telegram Desktop export doesn't preserve quote subsets
             ts=parent.ts,
-            user_id=parent.user_id,
         )
 
     result.messages = ordered

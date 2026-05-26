@@ -1,21 +1,31 @@
-import os
-from dotenv import load_dotenv
+from typing import Annotated, Self
 
-load_dotenv()
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-CLAUDE_API_KEY     = os.environ["CLAUDE_API_KEY"]
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+from .model import Model
 
-CLAUDE_MODEL            = os.environ["CLAUDE_MODEL"]
-CLAUDE_BOT_USERNAME     = os.environ["CLAUDE_BOT_USERNAME"]
-CLAUDE_BOT_DISPLAY_NAME = os.environ["CLAUDE_BOT_DISPLAY_NAME"]
+class Config(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", frozen=True)
 
-TOKEN_BUDGET  = int(os.environ["TOKEN_BUDGET"])
-REPLY_BUDGET  = int(os.environ["REPLY_BUDGET"])
-DATA_DIR      = os.environ.get("DATA_DIR", "data")
-LOG_DIR       = os.environ.get("LOG_DIR", "logs")
-IGNORE_PREFIX = os.environ.get("IGNORE_PREFIX")
+    claude_api_key: str
+    telegram_bot_token: str
+    default_claude_model: Model
+    token_budget: int
+    reply_budget: int
+    data_dir: str = "data"
+    log_dir: str = "logs"
+    ignore_prefix: str | None = None
+    system_prefix: str = "<System>"
+    admin_user_ids: Annotated[frozenset[int], NoDecode] = Field(default_factory=frozenset)
 
-ADMIN_USER_IDS = {
-    int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()
-}
+    @classmethod
+    def load(cls) -> Self:
+        return cls()  # type: ignore[call-arg]
+
+    @field_validator("admin_user_ids", mode="before")
+    @classmethod
+    def _parse_admins(cls, v):
+        if isinstance(v, str):
+            return frozenset(int(x) for x in v.split(",") if x.strip())
+        return v
