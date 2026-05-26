@@ -52,6 +52,9 @@ def format_tag(username: str, display_name: str, ts: Optional[datetime], display
     # no timestamp) -- drop the time fragment rather than emit a fake-precision
     # `??:?? +0000?` placeholder. Chat participants always have both, so only
     # forwards hit these branches.
+    # `display_name` should always be set, but guard against an empty/whitespace
+    # one (e.g. a corrupt persisted forward) so we never render bare `<>`.
+    display_name = display_name.strip() if display_name and display_name.strip() else "unknown"
     handle = f" (@{username})" if username else ""
     if ts is None:
         return f"<{display_name}{handle}>"

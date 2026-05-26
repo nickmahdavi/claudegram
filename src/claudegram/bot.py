@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 from string import Template
 from contextlib import asynccontextmanager
@@ -26,6 +27,10 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 # Discard pings older than this many seconds
 STALE_PING_AGE_S = 60
 TELEGRAM_CHAR_LIMIT = 4096
+# Coalesce per-chat view-log rewrites to at most one per this interval. A busy
+# group otherwise re-renders the whole window + writes a file on every message;
+# the bot only actually "sees" history at ping time, which forces a write anyway.
+VIEW_LOG_MIN_INTERVAL_S = 1.0
 TIMEZONES: frozenset[str] = frozenset(available_timezones())
 
 logger = logging.getLogger(__name__)
@@ -58,7 +63,9 @@ def get_forward(message: telegram.Message) -> Optional[Forward]:
         )
     if isinstance(origin, telegram.MessageOriginChat):
         chat = origin.sender_chat
-        name = chat.title or chat.full_name or chat.username or "chat"
+        # sender_chat is a group/supergroup/channel acting as sender, so it has a
+        # title, not full_name (the latter is a deprecated user-only alias).
+        name = chat.title or chat.username or "chat"
         if origin.author_signature:
             name = f"{name} ({origin.author_signature})"
         return Forward(
@@ -120,6 +127,12 @@ class Bot:
 
         self.start_time = datetime.now(UTC)
 
+        # View-log bookkeeping: per-chat throttle clock + warn-once dedupe so a
+        # persistently failing view write (e.g. unwritable log_dir) is surfaced
+        # once instead of on every message.
+        self._view_last_write: dict[int, float] = {}
+        self._view_warned: set[int] = set()
+
     async def _post_init(self, _: Application):
         try:
             me = await self.application.bot.get_me()
@@ -138,13 +151,28 @@ class Bot:
             raise RuntimeError("Bot identity not loaded yet (app not initialized?)")
         return self._me
 
-    def _write_chat_view(self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo]) -> None:
-        """Rewrite the per-chat 'as the bot sees it' log: the current window rendered
-        into H:/A: turns, exactly as it would be sent to the model. Overwrite-snapshot
-        (truncate in place) so the file always reflects current state and stays tailable.
-        Best-effort -- a logging failure must never break message handling."""
+    def _should_write_view(self, chat_id: int, force: bool) -> bool:
+        """Throttle gate for the view log. Returns True (and arms the clock) when a
+        write should happen now. `force=True` (the ping render -- the moment the bot
+        actually sees the history) always writes. Pure/synchronous: call it under the
+        chat lock before taking a snapshot so we only snapshot when we'll write."""
         if not self.config.chat_view_log:
-            return
+            return False
+        now = time.monotonic()
+        if not force and now - self._view_last_write.get(chat_id, 0.0) < VIEW_LOG_MIN_INTERVAL_S:
+            return False
+        self._view_last_write[chat_id] = now
+        return True
+
+    async def _write_chat_view(self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo]) -> None:
+        """Rewrite the per-chat 'as the bot sees it' log: the current window rendered
+        into H:/A: turns -- the same shape sent to the model at ping time. Rendering
+        runs on the loop (it reads the store's identity table, which is only safe on
+        the loop); the file write is offloaded with asyncio.to_thread and done via a
+        tmp + os.replace swap so a reader never sees a torn/empty file. Because the
+        swap changes the inode, follow it with `tail -F` (not `-f`). Best-effort: a
+        logging failure must never break message handling, and a persistent failure
+        is warned about once per chat rather than on every write."""
         try:
             messages = render_history(snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz)
             blocks = []
@@ -155,12 +183,23 @@ class Bot:
                 content = content if isinstance(content, str) else str(content)
                 blocks.append(f"{prefix} {content}")
             text = "\n\n".join(blocks) + "\n" if blocks else ""
-            path = self.store.view_path(chat_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
+            await asyncio.to_thread(self._write_view_file, self.store.view_path(chat_id), text)
+            self._view_warned.discard(chat_id)
         except Exception:
-            logger.debug("Failed to write chat view log for chat %s", chat_id, exc_info=True)
+            if chat_id not in self._view_warned:
+                self._view_warned.add(chat_id)
+                logger.warning("Failed to write chat view log for chat %s (further failures suppressed)",
+                               chat_id, exc_info=True)
+
+    @staticmethod
+    def _write_view_file(path, text: str) -> None:
+        """Atomic overwrite (runs in a worker thread): write to a sibling tmp file
+        then os.replace it into place."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
 
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -193,7 +232,12 @@ class Bot:
                 ts=replied.date,
             )
 
-        forward = get_forward(message)
+        try:
+            forward = get_forward(message)
+        except Exception:
+            logger.warning("Failed to extract forward origin in chat %s; storing without it",
+                           message.chat_id, exc_info=True)
+            forward = None
 
         msg = Message(
             id=message.message_id,
@@ -211,11 +255,13 @@ class Bot:
             if evicted:
                 logger.debug("Evicted %d message(s) from working set in chat %s", len(evicted), message.chat_id)
             self.store.persist(message.chat_id)
-            view_snapshot = window.snapshot()
+            # Only snapshot when we'll actually write -- snapshot() copies the window.
+            view_snapshot = window.snapshot() if self._should_write_view(message.chat_id, force=False) else None
 
-        is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
-        view_tz = self.store.resolve_user(message.from_user.id).tz if is_private else UTC
-        self._write_chat_view(message.chat_id, view_snapshot, view_tz)
+        if view_snapshot is not None:
+            is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
+            view_tz = self.store.resolve_user(message.from_user.id).tz if is_private else UTC
+            await self._write_chat_view(message.chat_id, view_snapshot, view_tz)
 
     async def on_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -395,10 +441,11 @@ class Bot:
             view_snapshot = None
             if window is not None:
                 self.store.persist(message.chat_id)
-                view_snapshot = window.snapshot()
+                if self._should_write_view(message.chat_id, force=True):
+                    view_snapshot = window.snapshot()
 
         if view_snapshot is not None:
-            self._write_chat_view(message.chat_id, view_snapshot, display_tz)
+            await self._write_chat_view(message.chat_id, view_snapshot, display_tz)
 
     def _is_admin(self, update: Update) -> bool:
         user = update.effective_user

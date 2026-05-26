@@ -89,6 +89,10 @@ class Message:
 
     TAG_OVERHEAD: ClassVar[int] = 12
     REPLY_OVERHEAD: ClassVar[int] = 20
+    # Flat estimate for the extra `fwd. <tag>` line. Approximates a rich tag
+    # (name + @handle + time); slightly over-counts handle-less/imported forwards.
+    # Like the others it's a heuristic -- actual usage is corrected by the
+    # estimated-vs-true ratio logged after each completion.
     FORWARD_OVERHEAD: ClassVar[int] = 12
 
     @property

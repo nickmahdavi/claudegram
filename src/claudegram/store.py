@@ -408,5 +408,12 @@ class Store:
         if ctx_exists:
             ctx_path.unlink()
             logger.info("Deleted context history (%s) for chat %s", ctx_path, chat_id)
-        
+
+        # Drop the human-readable view log too, so it doesn't linger showing
+        # pre-reset history until the next message rewrites it.
+        view_path = self.view_path(chat_id)
+        if view_path.exists():
+            view_path.unlink()
+            logger.info("Deleted chat view log (%s) for chat %s", view_path, chat_id)
+
         return (deleted_window, chat_exists, ctx_exists)

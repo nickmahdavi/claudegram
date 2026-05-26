@@ -164,9 +164,10 @@ def parse_export(
         # don't parse those and they're silently treated as "no forward." Worth
         # revisiting if it ever shows up at volume.
         forwarded_from = m.get("forwarded_from")
+        forwarded_from = forwarded_from.strip() if isinstance(forwarded_from, str) else None
         forward = (
             Forward(display_name=forwarded_from, username="", ts=None, user_id=None)
-            if isinstance(forwarded_from, str) and forwarded_from
+            if forwarded_from
             else None
         )
 
