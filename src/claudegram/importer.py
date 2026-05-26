@@ -169,10 +169,19 @@ def parse_export(
         # posts occasionally appear as a dict with structured origin metadata; we
         # don't parse those and they're silently treated as "no forward." Worth
         # revisiting if it ever shows up at volume.
+        # `forwarded_from_id` (when present) is the original author's id in the
+        # same "user<digits>" form as from_id; capture it for parity with the
+        # live ingest path. Channel origins ("channel<id>") yield None, leaving
+        # user_id unset -- same as a hidden/channel forward.
         forwarded_from = m.get("forwarded_from")
         forwarded_from = forwarded_from.strip() if isinstance(forwarded_from, str) else None
         forward = (
-            Forward(display_name=forwarded_from, username="", ts=None, user_id=None)
+            Forward(
+                display_name=forwarded_from,
+                username="",
+                ts=None,
+                user_id=_extract_user_id(m.get("forwarded_from_id")),
+            )
             if forwarded_from
             else None
         )
