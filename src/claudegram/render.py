@@ -40,7 +40,7 @@ def build_tz_directory(users: set[int], resolve: Resolver) -> str:
 
 def fmt_offset(tz: Optional[ZoneInfo], at: Optional[datetime] = None) -> str:
     if not tz:
-        return "+0000?"
+        return "+00?"
     moment = at or datetime.now(UTC)
     off = moment.astimezone(tz).strftime("%z")  # e.g. '-0400', '+0530'
     sign, hh, mm = off[0], off[1:3], off[3:5]
