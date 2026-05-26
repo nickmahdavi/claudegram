@@ -149,9 +149,15 @@ def parse_export(
         # kept history (no orphans for users whose messages were all dropped).
         if user_id not in result.users:
             from_name = m.get("from")
+            # Telegram Desktop exports carry a display name ("from") but no
+            # @handle, so leave username blank rather than fabricating a
+            # "user_<id>" placeholder: render/format_tag and the tz directory
+            # drop the @handle segment for blank usernames, and a later live
+            # message from the same user can still fill in a real handle (a
+            # blank can't, so note_user never has to un-stick a fake one).
             result.users[user_id] = UserInfo(
                 user_id=user_id,
-                username=f"user_{user_id}",
+                username="",
                 display_name=from_name if isinstance(from_name, str) and from_name.strip() else f"user_{user_id}",
             )
 

@@ -31,7 +31,10 @@ def build_tz_directory(users: set[int], resolve: Resolver) -> str:
     for user_id in sorted(users):
         user = resolve(user_id)
         user_tz_str = user.tz.key if user.tz else 'unset (00?), treat as UTC'
-        lines.append(f"  @{user.username} (id={user.user_id}) — {user_tz_str}")
+        # Imported / handle-less users have a blank username; identify them by
+        # display name rather than emitting a bare "@".
+        who = f"@{user.username}" if user.username else (user.display_name or f"id {user.user_id}")
+        lines.append(f"  {who} (id={user.user_id}) — {user_tz_str}")
 
     return "\n".join(lines)
 
