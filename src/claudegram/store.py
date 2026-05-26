@@ -62,6 +62,10 @@ class Store:
     def chat_path(self, chat_id: int) -> Path:
         return self.data_dir / f"chat_{chat_id}.jsonl"
 
+    def view_path(self, chat_id: int) -> Path:
+        # Human-readable "as the bot sees it" render, lives in log_dir (it's a log, not data).
+        return self.log_dir / f"chat_{chat_id}.view.log"
+
     def context_path(self, chat_id: int) -> Path:
         return self.log_dir / f"chat_{chat_id}.context.log"
 

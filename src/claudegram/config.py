@@ -15,6 +15,7 @@ class Config(BaseSettings):
     reply_budget: int
     data_dir: str = "data"
     log_dir: str = "logs"
+    chat_view_log: bool = True
     ignore_prefix: str | None = None
     system_prefix: str = "<System>"
     admin_user_ids: Annotated[frozenset[int], NoDecode] = Field(default_factory=frozenset)

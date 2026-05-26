@@ -138,6 +138,30 @@ class Bot:
             raise RuntimeError("Bot identity not loaded yet (app not initialized?)")
         return self._me
 
+    def _write_chat_view(self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo]) -> None:
+        """Rewrite the per-chat 'as the bot sees it' log: the current window rendered
+        into H:/A: turns, exactly as it would be sent to the model. Overwrite-snapshot
+        (truncate in place) so the file always reflects current state and stays tailable.
+        Best-effort -- a logging failure must never break message handling."""
+        if not self.config.chat_view_log:
+            return
+        try:
+            messages = render_history(snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz)
+            blocks = []
+            for mp in messages:
+                # MessageParam is a TypedDict (plain dict at runtime), not an attr object.
+                prefix = "H:" if mp["role"] == "user" else "A:"
+                content = mp["content"]
+                content = content if isinstance(content, str) else str(content)
+                blocks.append(f"{prefix} {content}")
+            text = "\n\n".join(blocks) + "\n" if blocks else ""
+            path = self.store.view_path(chat_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            logger.debug("Failed to write chat view log for chat %s", chat_id, exc_info=True)
+
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
         # why is from_user nullable at all?
@@ -187,6 +211,11 @@ class Bot:
             if evicted:
                 logger.debug("Evicted %d message(s) from working set in chat %s", len(evicted), message.chat_id)
             self.store.persist(message.chat_id)
+            view_snapshot = window.snapshot()
+
+        is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
+        view_tz = self.store.resolve_user(message.from_user.id).tz if is_private else UTC
+        self._write_chat_view(message.chat_id, view_snapshot, view_tz)
 
     async def on_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -363,8 +392,13 @@ class Bot:
                             ts=message.date
                         ) if first else None
                     ))
+            view_snapshot = None
             if window is not None:
                 self.store.persist(message.chat_id)
+                view_snapshot = window.snapshot()
+
+        if view_snapshot is not None:
+            self._write_chat_view(message.chat_id, view_snapshot, display_tz)
 
     def _is_admin(self, update: Update) -> bool:
         user = update.effective_user
