@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from anthropic.types import MessageParam
 
 from .identity import UserInfo
-from .message import UTC, Message, Reply
+from .message import UTC, Forward, Message, Reply
 
 
 Resolver = Callable[[int], UserInfo]
@@ -46,10 +46,23 @@ def fmt_offset(tz: Optional[ZoneInfo], at: Optional[datetime] = None) -> str:
     return f"{sign}{hh}{mm}"
 
 def format_tag(username: str, display_name: str, ts: Optional[datetime], display_tz: Optional[ZoneInfo] = None) -> str:
+    # `username` may be falsy (forwards from hidden users / channels without a
+    # public @handle) -- drop the `(@handle)` segment rather than emit `(@)`.
+    # `ts` may be missing for forwards imported from Telegram Desktop (bare name,
+    # no timestamp) -- drop the time fragment rather than emit a fake-precision
+    # `??:?? +0000?` placeholder. Chat participants always have both, so only
+    # forwards hit these branches.
+    handle = f" (@{username})" if username else ""
     if ts is None:
-        return f"<{display_name} (@{username}) : ??:?? {fmt_offset(display_tz)}>"
+        return f"<{display_name}{handle}>"
     local = ts.astimezone(display_tz or UTC)
-    return f"<{display_name} (@{username}) : {local.strftime('%H:%M')} {fmt_offset(display_tz, ts)}>"
+    return f"<{display_name}{handle} : {local.strftime('%H:%M')} {fmt_offset(display_tz, ts)}>"
+
+def render_forward(forward: Forward, display_tz: Optional[ZoneInfo] = None) -> str:
+    # Rendered from the Forward's own snapshot (original author at original time),
+    # not via the resolver -- the origin usually isn't a chat participant.
+    tag = format_tag(forward.username, forward.display_name, forward.ts, display_tz)
+    return f"fwd. {tag}"
 
 def render_quote(reply: Reply, resolve: Resolver, display_tz: Optional[ZoneInfo] = None) -> str:
     user_info = resolve(reply.user_id)
@@ -72,11 +85,13 @@ def render_message(message: Message, resolve: Resolver, display_tz: Optional[Zon
     user_info = resolve(message.user_id)
     tz = display_tz or user_info.tz
     tag = format_tag(user_info.username, user_info.display_name, message.ts, tz)
-    body = f"{tag} {message.text}"
+    lines = []
+    if message.forward is not None:
+        lines.append(render_forward(message.forward, tz))
     if message.reply is not None:
-        quote = render_quote(message.reply, resolve, tz)
-        body = f"{quote}\n{body}"
-    return body
+        lines.append(render_quote(message.reply, resolve, tz))
+    lines.append(f"{tag} {message.text}")
+    return "\n".join(lines)
 
 def get_datemark(message: Message, resolve: Resolver, last_emitted_date: Optional[date], display_tz: Optional[ZoneInfo] = None) -> tuple[str, date]:
     # We also render a date separator if the message is on a different day from the last emitted

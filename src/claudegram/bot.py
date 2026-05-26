@@ -16,7 +16,7 @@ from .config import Config
 from .error import ErrorClass, admin_failure_dm, admin_recovery_dm, classify_error, user_reply
 from .identity import UserInfo
 from .importer import parse_export
-from .message import UTC, Message, Reply
+from .message import UTC, Forward, Message, Reply
 from .model import MODEL_ALIASES, SUPPORTED_MODELS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
 from .store import Store
@@ -36,6 +36,50 @@ def get_user_info(user: User) -> UserInfo:
         username=user.username or "",
         display_name=user.full_name,
     )
+
+def get_forward(message: telegram.Message) -> Optional[Forward]:
+    origin = message.forward_origin
+    if origin is None:
+        return None
+    if isinstance(origin, telegram.MessageOriginUser):
+        u = origin.sender_user
+        return Forward(
+            display_name=u.full_name or u.username or f"user_{u.id}",
+            username=u.username or "",
+            ts=origin.date,
+            user_id=u.id,
+        )
+    if isinstance(origin, telegram.MessageOriginHiddenUser):
+        return Forward(
+            display_name=origin.sender_user_name,
+            username="",
+            ts=origin.date,
+            user_id=None,
+        )
+    if isinstance(origin, telegram.MessageOriginChat):
+        chat = origin.sender_chat
+        name = chat.title or chat.full_name or chat.username or "chat"
+        if origin.author_signature:
+            name = f"{name} ({origin.author_signature})"
+        return Forward(
+            display_name=name,
+            username=chat.username or "",
+            ts=origin.date,
+            user_id=None,
+        )
+    if isinstance(origin, telegram.MessageOriginChannel):
+        chat = origin.chat
+        name = chat.title or chat.username or "channel"
+        if origin.author_signature:
+            name = f"{name} ({origin.author_signature})"
+        return Forward(
+            display_name=name,
+            username=chat.username or "",
+            ts=origin.date,
+            user_id=None,
+        )
+    logger.warning("Unknown forward_origin type %r in chat %s", type(origin).__name__, message.chat_id)
+    return None
 
 @asynccontextmanager
 async def keep_typing(bot, chat_id: int, interval: float = 4.0):
@@ -61,8 +105,8 @@ async def keep_typing(bot, chat_id: int, interval: float = 4.0):
 class Bot:
     SYSTEM_PROMPTS = {
         PromptMode.PREFILL: "The assistant is in CLI simulation mode, and responds to the user's CLI commands only with outputs of the commands.",
-        PromptMode.CHAT: "You're an LLM in a group conversation. Messages from other participants are prefixed with their name + handle + UTC time + offset suffix (e.g. '14:32 +00'). You should just send your messages like normal (no prefix).\nYour display name is $display_name, and your username is $username. Users might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name.\n$user_tz_directory\nHave fun!",
-        PromptMode.CHAT_PRIVATE: "You're an LLM in a private (1:1) conversation with $partner_display_name (@$partner_username). Their messages appear in human / user turns prefixed with their name + handle + local time + offset suffix (e.g. '14:32 -04'). Timestamps are rendered in their timezone ($partner_tz). You should just send your messages like normal (no prefix).\nYour display name is $display_name, and your username is $username. They might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name. Have fun!",
+        PromptMode.CHAT: "You're an LLM in a group conversation. Messages from other participants are prefixed with their name + handle + UTC time + offset suffix (e.g. '14:32 +00'). You should just send your messages like normal (no prefix).\nSome messages carry extra context on the line(s) above the body: 're. <name (@handle) ...> text' means the sender is replying to that earlier message; '> <name ...> \"text\"' means they quoted a specific span of it; 'fwd. <name (@handle) ...>' means the message was forwarded and the tag is the *original* author, not the participant who reposted it. Forwards from hidden users or channels may omit the @handle or the timestamp.\nYour display name is $display_name, and your username is $username. Users might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name.\n$user_tz_directory\nHave fun!",
+        PromptMode.CHAT_PRIVATE: "You're an LLM in a private (1:1) conversation with $partner_display_name (@$partner_username). Their messages appear in human / user turns prefixed with their name + handle + local time + offset suffix (e.g. '14:32 -04'). Timestamps are rendered in their timezone ($partner_tz). You should just send your messages like normal (no prefix).\nSome messages carry extra context on the line(s) above the body: 're. <name (@handle) ...> text' means they're replying to that earlier message; '> <name ...> \"text\"' means they quoted a specific span of it; 'fwd. <name (@handle) ...>' means the message was forwarded and the tag is the *original* author, not the person who sent it to you. Forwards from hidden users or channels may omit the @handle or the timestamp.\nYour display name is $display_name, and your username is $username. They might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name. Have fun!",
     }
 
     def __init__(self, store: Store, config: Config):
@@ -125,6 +169,8 @@ class Bot:
                 ts=replied.date,
             )
 
+        forward = get_forward(message)
+
         msg = Message(
             id=message.message_id,
             ts=message.date,
@@ -132,6 +178,7 @@ class Bot:
             text=text,
             reply_to=replied.message_id if replied else None,
             reply=reply,
+            forward=forward,
         )
 
         async with self.store.lock(message.chat_id):

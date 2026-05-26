@@ -8,7 +8,7 @@ from typing import Optional
 
 from .identity import UserInfo
 
-from .message import UTC, Message, Reply
+from .message import UTC, Forward, Message, Reply
 
 _COMMAND_RE = re.compile(r"^\s*/\w+(@\w+)?(\s|$)")
 
@@ -158,6 +158,18 @@ def parse_export(
         reply_to_raw = m.get("reply_to_message_id")
         reply_to = reply_to_raw if isinstance(reply_to_raw, int) else None
 
+        # Telegram Desktop almost always serializes `forwarded_from` as a bare
+        # display-name string (no @handle, no original send time). Channel-origin
+        # posts occasionally appear as a dict with structured origin metadata; we
+        # don't parse those and they're silently treated as "no forward." Worth
+        # revisiting if it ever shows up at volume.
+        forwarded_from = m.get("forwarded_from")
+        forward = (
+            Forward(display_name=forwarded_from, username="", ts=None, user_id=None)
+            if isinstance(forwarded_from, str) and forwarded_from
+            else None
+        )
+
         msg = Message(
             id=msg_id,
             ts=ts,
@@ -165,6 +177,7 @@ def parse_export(
             text=text,
             reply_to=reply_to,
             reply=None,
+            forward=forward,
         )
         by_id[msg_id] = msg
         ordered.append(msg)
