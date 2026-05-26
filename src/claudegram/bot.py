@@ -164,25 +164,51 @@ class Bot:
         self._view_last_write[chat_id] = now
         return True
 
-    async def _write_chat_view(self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo]) -> None:
-        """Rewrite the per-chat 'as the bot sees it' log: the current window rendered
-        into H:/A: turns -- the same shape sent to the model at ping time. Rendering
-        runs on the loop (it reads the store's identity table, which is only safe on
-        the loop); the file write is offloaded with asyncio.to_thread and done via a
-        tmp + os.replace swap so a reader never sees a torn/empty file. Because the
-        swap changes the inode, follow it with `tail -F` (not `-f`). Best-effort: a
+    def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
+        """Rebuild the system prompt this chat would be sent right now, for the view
+        log header. Mirrors on_ping's construction (mode, model pref, partner tz /
+        group tz directory) so the logged 'System:' matches what the model sees."""
+        prompt_mode = PromptMode.CHAT_PRIVATE if is_private else PromptMode.CHAT
+        prompt_template = Template(self.SYSTEM_PROMPTS.get(prompt_mode, ""))
+        chat_model = self.store.get_model_pref(chat_id) or self.config.default_claude_model
+        partner = self.store.resolve_user(partner_id) if (is_private and partner_id is not None) else None
+        tz_directory: Optional[str] = None
+        if not is_private:
+            known = {m.user_id for m in snapshot}
+            known.discard(self.me.user_id)
+            tz_directory = build_tz_directory(known, self.store.resolve_user)
+        return get_prompt(
+            prompt_template=prompt_template,
+            model=chat_model,
+            bot_info=self.me,
+            partner=partner,
+            tz_directory=tz_directory,
+        )
+
+    async def _write_chat_view(
+        self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
+        is_private: bool, partner_id: Optional[int],
+    ) -> None:
+        """Rewrite the per-chat 'as the bot sees it' log: a 'System:' header with the
+        chat's current system prompt, followed by the window rendered into H:/A:
+        turns -- the same shape sent to the model at ping time. Rendering runs on the
+        loop (it reads the store's identity table, which is only safe on the loop);
+        the file write is offloaded with asyncio.to_thread and done via a tmp +
+        os.replace swap so a reader never sees a torn/empty file. Because the swap
+        changes the inode, follow it with `tail -F` (not `-f`). Best-effort: a
         logging failure must never break message handling, and a persistent failure
         is warned about once per chat rather than on every write."""
         try:
+            system = self._view_system_prompt(chat_id, snapshot, is_private, partner_id)
             messages = render_history(snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz)
-            blocks = []
+            blocks = [f"System: {system}"]
             for mp in messages:
                 # MessageParam is a TypedDict (plain dict at runtime), not an attr object.
                 prefix = "H:" if mp["role"] == "user" else "A:"
                 content = mp["content"]
                 content = content if isinstance(content, str) else str(content)
                 blocks.append(f"{prefix} {content}")
-            text = "\n\n".join(blocks) + "\n" if blocks else ""
+            text = "\n\n".join(blocks) + "\n"
             await asyncio.to_thread(self._write_view_file, self.store.view_path(chat_id), text)
             self._view_warned.discard(chat_id)
         except Exception:
@@ -261,7 +287,7 @@ class Bot:
         if view_snapshot is not None:
             is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
             view_tz = self.store.resolve_user(message.from_user.id).tz if is_private else UTC
-            await self._write_chat_view(message.chat_id, view_snapshot, view_tz)
+            await self._write_chat_view(message.chat_id, view_snapshot, view_tz, is_private, message.from_user.id)
 
     async def on_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -445,7 +471,7 @@ class Bot:
                     view_snapshot = window.snapshot()
 
         if view_snapshot is not None:
-            await self._write_chat_view(message.chat_id, view_snapshot, display_tz)
+            await self._write_chat_view(message.chat_id, view_snapshot, display_tz, is_private, message.from_user.id)
 
     def _is_admin(self, update: Update) -> bool:
         user = update.effective_user
