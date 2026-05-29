@@ -12,6 +12,7 @@ dependencies = [
     "python-telegram-bot>=22.0",
     "python-dotenv>=1.0",
     "pydantic-settings>=2.14.1",
+    "cryptography>=43",
 ]
 
 [project.scripts]

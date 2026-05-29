@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from string import Template
 from contextlib import asynccontextmanager
@@ -8,13 +9,35 @@ from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo, available_timezones
 
-import anthropic
 import telegram
 from telegram import Update, User
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    ApplicationHandlerStop,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from .config import Config
-from .error import ErrorClass, admin_failure_dm, admin_recovery_dm, classify_error, user_reply
+from .credentials import (
+    USER_OWNED_KINDS,
+    BillingMode,
+    Credential,
+    CredentialKind,
+    CredentialStore,
+)
+from .error import (
+    ErrorClass,
+    admin_failure_dm,
+    admin_recovery_dm,
+    classify_error,
+    credential_broken_reply,
+    no_credential_reply,
+    user_credential_failed_reply,
+    user_reply,
+)
 from .identity import UserInfo
 from .importer import parse_export
 from .message import UTC, Forward, Message, Reply
@@ -34,6 +57,17 @@ VIEW_LOG_MIN_INTERVAL_S = 1.0
 TIMEZONES: frozenset[str] = frozenset(available_timezones())
 
 logger = logging.getLogger(__name__)
+
+# Anthropic API keys / OAuth tokens look like `sk-ant-...` followed by a long
+# token body. Require the trailing body (>=10 url-safe chars) so we don't nuke a
+# DM that merely *mentions* the "sk-ant-" prefix while still catching a pasted
+# key anywhere in the message (incl. mid-sentence or in a caption).
+_SECRET_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]{10,}")
+
+
+def _looks_like_secret(text: str) -> bool:
+    return _SECRET_RE.search(text) is not None
+
 
 def get_user_info(user: User) -> UserInfo:
     return UserInfo(
@@ -116,14 +150,24 @@ class Bot:
         PromptMode.CHAT_PRIVATE: "You're an LLM in a private (1:1) conversation with $partner_display_name (@$partner_username). Their messages appear in human / user turns prefixed with their name + handle + local time + offset suffix (e.g. '14:32 -04'). Timestamps are rendered in their timezone ($partner_tz). You should just send your messages like normal (no prefix).\nSome messages carry extra context on the line(s) above the body: 're. <name (@handle) ...> text' means they're replying to that earlier message; '> <name ...> \"text\"' means they quoted a specific span of it; 'fwd. <name (@handle) ...>' means the message was forwarded and the tag is the *original* author, not the person who sent it to you. Forwards from hidden users or channels may omit the @handle or the timestamp.\nYour display name is $display_name, and your username is $username. They might address you by your model name as well (e.g. Opus, Sonnet, version number, etc), so for context, your model name is $model_name. Have fun!",
     }
 
-    def __init__(self, store: Store, config: Config):
+    def __init__(self, store: Store, config: Config, credentials: CredentialStore):
         self.store = store
         self.config = config
+        self.credentials = credentials
 
         self._me: Optional[UserInfo] = None
 
-        self.client = anthropic.AsyncClient(api_key=config.claude_api_key)
-        self.application = Application.builder().token(self.config.telegram_bot_token).post_init(self._post_init).build()
+        # The shared bot/pool key lives in the credential store; keep a handle
+        # for any direct use (e.g. legacy call sites). Per-request clients are
+        # resolved via self.credentials.client_for(...).
+        self.client = credentials.pool_client
+        self.application = (
+            Application.builder()
+            .token(self.config.telegram_bot_token)
+            .post_init(self._post_init)
+            .post_shutdown(self._post_shutdown)
+            .build()
+        )
 
         self.start_time = datetime.now(UTC)
 
@@ -144,6 +188,12 @@ class Bot:
         logger.info("Bot initialized: id=%d default_model=%r ignore_prefix=%r admins=%d start_time=%s",
                     self.me.user_id, self.config.default_claude_model, self.config.ignore_prefix,
                     len(self.config.admin_user_ids), self.start_time.isoformat())
+
+    async def _post_shutdown(self, _: Application):
+        # Close every per-user httpx pool (and the shared pool client) exactly
+        # once, at shutdown — never mid-run, where an evicted client might still
+        # be serving an in-flight completion on another coroutine.
+        await self.credentials.aclose()
 
     @property
     def me(self) -> UserInfo:
@@ -227,23 +277,62 @@ class Bot:
             f.write(text)
         os.replace(tmp, path)
 
+    async def _drop_pasted_secret(self, message: telegram.Message) -> None:
+        """Delete a message that contains an API key, refuse, and warn. Shared by
+        the new-message and edited-message guards. Callers raise
+        ApplicationHandlerStop afterwards so no later handler group sees it."""
+        is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
+        logger.warning(
+            "Suspected API key in %s chat %s from user %s; dropping unstored",
+            message.chat.type, message.chat_id,
+            message.from_user.id if message.from_user else None,
+        )
+        deleted = False
+        try:
+            deleted = bool(await message.delete())
+        except Exception:
+            logger.warning("Could not delete suspected-key message in chat %s", message.chat_id)
+        prefix = self.config.system_prefix
+        if is_private:
+            note = "I deleted it and did not store it." if deleted else "I did not store it (couldn't delete it — please remove it)."
+            await message.reply_text(
+                f"{prefix} That looked like an API key, so {note} Use /setkey <key> to register it securely."
+            )
+        else:
+            note = "I deleted it." if deleted else "Please delete it — I couldn't."
+            await message.reply_text(
+                f"{prefix} Don't paste API keys in a group. {note} DM me /setkey <key> in private instead."
+            )
+
     async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
         # why is from_user nullable at all?
         if not message or not message.from_user:
             return
 
-        if not self.store.is_active(message.chat_id):
-            return
-
         text = message.text or message.caption
         if not text:
+            return
+
+        # Secret guard — FIRST, in EVERY chat type, and BEFORE the is_active /
+        # ignore_prefix gates. A pasted key (incl. as a media caption, which
+        # filters.COMMAND doesn't exclude so /setkey-as-caption lands here too)
+        # would otherwise be written to chat history in plaintext AND, if it
+        # pings the bot, rendered into the prompt and echoed in the reply. Group
+        # chats are just as exposed as DMs. Delete it, refuse, and raise
+        # ApplicationHandlerStop so on_ping (a later handler group) never sees it
+        # (a bare `return` only ends THIS handler).
+        if _looks_like_secret(text):
+            await self._drop_pasted_secret(message)
+            raise ApplicationHandlerStop
+
+        if not self.store.is_active(message.chat_id):
             return
 
         if self.config.ignore_prefix and text.startswith(self.config.ignore_prefix):
             logger.debug("Skipping ignored message (prefix=%r) in chat %s", self.config.ignore_prefix, message.chat_id)
             return
-        
+
         self.store.note_user(get_user_info(message.from_user))
 
         reply = None
@@ -288,6 +377,21 @@ class Bot:
             is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
             view_tz = self.store.resolve_user(message.from_user.id).tz if is_private else UTC
             await self._write_chat_view(message.chat_id, view_snapshot, view_tz, is_private, message.from_user.id)
+
+    async def on_edited_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """A user editing a benign message to insert a key arrives as an
+        edited_message, which on_message/on_ping (both read update.message) never
+        process — so the key wouldn't be stored, but also wouldn't be cleaned up.
+        Apply the same secret guard here. Registered ahead of on_message in the
+        same group with an EDITED_MESSAGE-only filter, so normal messages still
+        fall through to on_message."""
+        message = update.edited_message
+        if not message:
+            return
+        text = message.text or message.caption
+        if text and _looks_like_secret(text):
+            await self._drop_pasted_secret(message)
+            raise ApplicationHandlerStop
 
     async def on_ping(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         message = update.message
@@ -357,6 +461,24 @@ class Bot:
             )
             return
 
+        # Resolve whose credential pays for this ping. None => polite refusal,
+        # and crucially we must NOT touch the failure-streak/admin-alert
+        # machinery (that tracks only the bot's pool key). Done before any
+        # prompt building or typing indicator so a refusal is cheap and silent.
+        cred = self.credentials.resolve_credential(message.from_user.id, message.chat_id, is_private)
+        if cred is None:
+            logger.info("No credential for user %s in chat %s; refusing", message.from_user.id, message.chat_id)
+            await message.reply_text(f"{self.config.system_prefix} {no_credential_reply(is_private)}")
+            return
+        try:
+            client = self.credentials.client_for(cred)
+        except Exception:
+            logger.exception(
+                "Failed to build client for cred kind=%s user=%s", cred.kind.value, message.from_user.id,
+            )
+            await message.reply_text(f"{self.config.system_prefix} {credential_broken_reply()}")
+            return
+
         prompt_template = Template(self.SYSTEM_PROMPTS.get(prompt_mode, ""))
         chat_model = self.store.get_model_pref(message.chat_id) or self.config.default_claude_model
         partner: Optional[UserInfo] = None
@@ -392,7 +514,7 @@ class Bot:
         async with keep_typing(context.bot, message.chat_id):
             try:
                 reply = await complete(
-                    client=self.client,
+                    client=client,
                     model=chat_model,
                     system=system,
                     messages=messages,
@@ -409,11 +531,16 @@ class Bot:
                     reply.input_tokens, reply.cache_write, reply.cache_read, reply.output_tokens,
                 )
             except Exception as exc:
-                await self._handle_completion_error(message, exc)
+                await self._handle_completion_error(message, exc, cred)
                 return
 
-        async with self.store.lock(message.chat_id):
-            prior_failures = self.store.note_success(message.chat_id)
+        # Only a POOL (bot-key) success clears the chat's failure streak.
+        # Clearing it on a user-key success would let one BYO user mask an
+        # ongoing pool outage and flap the recovery/outage admin alerts.
+        prior_failures = 0
+        if cred.kind == CredentialKind.POOL:
+            async with self.store.lock(message.chat_id):
+                prior_failures = self.store.note_success(message.chat_id)
         if prior_failures:
             await self._notify_admins_recovered(message.chat_id, prior_failures)
 
@@ -477,9 +604,32 @@ class Bot:
         user = update.effective_user
         return user is not None and user.id in self.config.admin_user_ids
 
-    async def _handle_completion_error(self, message: telegram.Message, exc: Exception) -> None:
+    async def _handle_completion_error(
+        self, message: telegram.Message, exc: Exception, cred: Credential,
+    ) -> None:
         chat_id = message.chat_id
         err_class, err_desc = classify_error(exc)
+
+        # Per-user failure isolation. A failure on a user's OWN credential
+        # (bad/expired key, out-of-credit, their account rate-limited, etc.)
+        # must be attributed to that user and must NOT feed the chat's
+        # failure-streak / admin-alert machinery, which tracks only the bot's
+        # pool key. Out-of-credit (402) is the most common BYO failure and the
+        # easiest to misattribute as "the bot is down".
+        if cred.kind in USER_OWNED_KINDS:
+            logger.warning(
+                "User-owned credential failure (user=%s, kind=%s, class=%s, desc=%s)",
+                message.from_user.id if message.from_user else None,
+                cred.kind.value, err_class.value, err_desc,
+            )
+            try:
+                await message.reply_text(
+                    f"{self.config.system_prefix} {user_credential_failed_reply(err_class)}"
+                )
+            except Exception:
+                logger.exception("Failed to send per-user credential error reply in chat %s", chat_id)
+            return
+
         # Serialize the whole failure-state transition for this chat. Without
         # the lock, two concurrent failing pings could both clear the
         # should_send/should_alert gates and double-send error replies or
@@ -833,6 +983,15 @@ class Bot:
             "`/tz [name]`: show or set your timezone (IANA name, e.g. `America/New_York`)",
             "`/whoami`: show your telegram user id",
             "`/help`: show this message",
+            "",
+            "*Credentials:*",
+            "`/setkey <key>`: store your own Anthropic key (DM only; I delete the message)",
+            "`/forgetkey`: delete your stored key",
+            "`/keystatus`: show your stored credential (masked)",
+            f"`/allow <user_id|reply>`: add a user to the shared pool{admin_note}",
+            f"`/disallow <user_id|reply>`: remove a user from the pool{admin_note}",
+            f"`/poollist`: list pooled users{admin_note}",
+            f"`/billing [triggering|designated]`: who pays in this group{admin_note}",
         ]
         await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -905,6 +1064,229 @@ class Bot:
             parse_mode="Markdown",
         )
 
+    # ---- credential / pool / billing commands --------------------------
+    # These interpolate user-controlled display names, so they send plain text
+    # (no parse_mode) to avoid Markdown injection breaking the whole send.
+
+    @staticmethod
+    def _target_user_id(message: telegram.Message, args: list[str]) -> Optional[int]:
+        """A target user id from a reply (preferred) or the first int-looking arg."""
+        if message.reply_to_message and message.reply_to_message.from_user:
+            return message.reply_to_message.from_user.id
+        for a in args:
+            try:
+                return int(a)
+            except ValueError:
+                continue
+        return None
+
+    async def command_setkey(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message or not message.from_user:
+            return
+        prefix = self.config.system_prefix
+        is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
+
+        # The inbound message carries the secret — delete it ASAP, any chat.
+        deleted = False
+        try:
+            deleted = bool(await message.delete())
+        except Exception:
+            logger.warning("Could not delete /setkey message in chat %s", message.chat_id)
+
+        if not is_private:
+            tail = " I deleted it." if deleted else " Delete your message above — I couldn't."
+            await message.reply_text(
+                f"{prefix} Don't share a key in a group.{tail} DM me /setkey <key> instead."
+            )
+            return
+
+        if not self.credentials.secrets.available:
+            await message.reply_text(
+                f"{prefix} Credential storage isn't configured on this bot. Ask the admin to set CREDENTIAL_ENC_KEY."
+            )
+            return
+
+        args = context.args or []
+        if not args:
+            await message.reply_text(
+                f"{prefix} Usage: /setkey <your-anthropic-key>. Send it here in this DM; I delete the message right away."
+            )
+            return
+
+        key = args[0].strip()
+        verdict = await self.credentials.validate_api_key(key)
+        if verdict == "rejected":
+            await message.reply_text(f"{prefix} That key was rejected (bad or unauthorized). Nothing stored.")
+            return
+
+        self.credentials.set_credential(Credential(
+            user_id=message.from_user.id,
+            kind=CredentialKind.USER_API_KEY,
+            secret=key,
+            last_validated_at=datetime.now(UTC) if verdict == "ok" else None,
+        ))
+        tail = key[-4:] if len(key) >= 4 else "????"
+        unverified = " (I couldn't fully validate it just now, but stored it)" if verdict == "unverified" else ""
+        delnote = " Deleted your message." if deleted else " Couldn't delete your message — please remove it."
+        await message.reply_text(
+            f"{prefix} Stored your key (…{tail}); I'll bill your messages to it{unverified}.{delnote}"
+        )
+
+    async def command_forgetkey(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        user = update.effective_user
+        if not message or not user:
+            return
+        prefix = self.config.system_prefix
+        removed = self.credentials.forget_credential(user.id)
+        if removed:
+            await message.reply_text(f"{prefix} Removed your stored credential.")
+        else:
+            await message.reply_text(f"{prefix} You had no stored credential.")
+
+    async def command_keystatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        user = update.effective_user
+        if not message or not user:
+            return
+        prefix = self.config.system_prefix
+        cred = self.credentials.get_credential(user.id)
+        pooled = self.credentials.is_pooled(user.id)
+        if cred is not None:
+            kind_label = {
+                CredentialKind.USER_API_KEY: "API key",
+                CredentialKind.OAUTH_SUBSCRIPTION: "subscription",
+            }.get(cred.kind, cred.kind.value)
+            validated = cred.last_validated_at.date().isoformat() if cred.last_validated_at else "not validated"
+            pool_note = " (also in the shared pool, but your own key takes precedence)" if pooled else ""
+            await message.reply_text(
+                f"{prefix} Stored {kind_label} {cred.masked_secret()}, added {cred.created_at.date().isoformat()}, "
+                f"last validated {validated}{pool_note}."
+            )
+        elif pooled:
+            await message.reply_text(f"{prefix} No personal key — you're using the shared pool (bot's key).")
+        else:
+            await message.reply_text(
+                f"{prefix} No credential. DM me /setkey <key>, or ask an admin to add you to the pool."
+            )
+
+    async def command_allow(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message:
+            return
+        if not self._is_admin(update):
+            logger.warning("Non-admin /allow denied (user_id=%s)", update.effective_user.id if update.effective_user else None)
+            return
+        prefix = self.config.system_prefix
+        target = self._target_user_id(message, context.args or [])
+        if target is None:
+            await message.reply_text(f"{prefix} Usage: /allow <user_id> (or reply to one of their messages).")
+            return
+        added = self.credentials.add_to_pool(target)
+        name = self.store.resolve_user(target).display_name
+        if added:
+            await message.reply_text(f"{prefix} Added {name} (id {target}) to the pool.")
+        else:
+            await message.reply_text(f"{prefix} {name} (id {target}) was already in the pool.")
+
+    async def command_disallow(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message:
+            return
+        if not self._is_admin(update):
+            logger.warning("Non-admin /disallow denied (user_id=%s)", update.effective_user.id if update.effective_user else None)
+            return
+        prefix = self.config.system_prefix
+        target = self._target_user_id(message, context.args or [])
+        if target is None:
+            await message.reply_text(f"{prefix} Usage: /disallow <user_id> (or reply to one of their messages).")
+            return
+        removed = self.credentials.remove_from_pool(target)
+        name = self.store.resolve_user(target).display_name
+        if removed:
+            await message.reply_text(f"{prefix} Removed {name} (id {target}) from the pool.")
+        else:
+            await message.reply_text(f"{prefix} {name} (id {target}) wasn't in the pool.")
+
+    async def command_poollist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message:
+            return
+        if not self._is_admin(update):
+            logger.warning("Non-admin /poollist denied (user_id=%s)", update.effective_user.id if update.effective_user else None)
+            return
+        prefix = self.config.system_prefix
+        ids = self.credentials.list_pool()
+        if not ids:
+            await message.reply_text(f"{prefix} The pool is empty. /allow <user_id> to add someone.")
+            return
+        lines = [f"{prefix} Pool ({len(ids)}):"]
+        lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
+        await message.reply_text("\n".join(lines))
+
+    async def command_billing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message:
+            return
+        prefix = self.config.system_prefix
+        is_private = message.chat.type == telegram.constants.ChatType.PRIVATE
+        if is_private:
+            await message.reply_text(
+                f"{prefix} Billing modes are for group chats. In a DM your own credential is always used."
+            )
+            return
+        if not self._is_admin(update):
+            logger.warning("Non-admin /billing denied in chat %s", message.chat_id)
+            return
+
+        chat_id = message.chat_id
+        args = context.args or []
+        if not args:
+            mode, designated = self.credentials.get_billing(chat_id)
+            if mode == BillingMode.CHAT_DESIGNATED and designated is not None:
+                name = self.store.resolve_user(designated).display_name
+                desc = f"chat-designated — {name} (id {designated}) pays for everyone here"
+            else:
+                desc = "triggering-user — whoever pings pays (default)"
+            await message.reply_text(
+                f"{prefix} Billing here: {desc}.\n"
+                "Change with /billing triggering, or /billing designated [reply|<user_id>] "
+                "(with no reply/id, designates you)."
+            )
+            return
+
+        sub = args[0].lower().strip()
+        if sub in ("triggering", "trigger", "pinger", "triggering_user"):
+            self.credentials.set_billing(chat_id, BillingMode.TRIGGERING_USER)
+            await message.reply_text(f"{prefix} Billing set: whoever pings pays (their own key or the pool).")
+            return
+        if sub in ("designated", "designate", "chat", "chat_designated"):
+            if message.reply_to_message and message.reply_to_message.from_user:
+                target = message.reply_to_message.from_user.id
+            elif len(args) >= 2:
+                try:
+                    target = int(args[1])
+                except ValueError:
+                    await message.reply_text(f"{prefix} Couldn't parse a user id from {args[1]!r}.")
+                    return
+            else:
+                target = update.effective_user.id if update.effective_user else None
+            if target is None:
+                await message.reply_text(f"{prefix} Usage: /billing designated [reply|<user_id>] (defaults to you).")
+                return
+            self.credentials.set_billing(chat_id, BillingMode.CHAT_DESIGNATED, target)
+            name = self.store.resolve_user(target).display_name
+            no_cred = self.credentials.get_credential(target) is None and not self.credentials.is_pooled(target)
+            warn = (
+                " Warning: they have no stored key and aren't in the pool, so pings here will be refused until that's fixed."
+                if no_cred else ""
+            )
+            await message.reply_text(f"{prefix} Billing set: {name} (id {target}) pays for this chat.{warn}")
+            return
+
+        await message.reply_text(f"{prefix} Unknown option {sub!r}. Use 'triggering' or 'designated'.")
+
     def start(self):
         # TODO: maybe a pre-message handler to ingest metadata like user info, chat info, etc.
         # but this obscures the actual contract for data availability-- for now, prefer to have
@@ -917,12 +1299,27 @@ class Bot:
         self.application.add_handler(CommandHandler("model", self.command_model), group=0)
         self.application.add_handler(CommandHandler("tz", self.command_tz), group=0)
         self.application.add_handler(CommandHandler("help", self.command_help), group=0)
+        self.application.add_handler(CommandHandler("setkey", self.command_setkey), group=0)
+        self.application.add_handler(CommandHandler("forgetkey", self.command_forgetkey), group=0)
+        self.application.add_handler(CommandHandler("keystatus", self.command_keystatus), group=0)
+        self.application.add_handler(CommandHandler("allow", self.command_allow), group=0)
+        self.application.add_handler(CommandHandler("disallow", self.command_disallow), group=0)
+        self.application.add_handler(CommandHandler("poollist", self.command_poollist), group=0)
+        self.application.add_handler(CommandHandler("billing", self.command_billing), group=0)
 
         load_filter = (
             filters.Document.FileExtension("json")
             | filters.Document.MimeType("application/json")
         ) & filters.CaptionRegex(r"^/load(@\w+)?(\s|$)")
         self.application.add_handler(MessageHandler(load_filter, self.command_load), group=0)
+
+        # Edited-message secret guard, registered ahead of on_message in group 1
+        # (PTB runs the first matching handler per group). Its EDITED_MESSAGE
+        # filter means normal messages fall through to on_message untouched,
+        # while an edited-in key is caught and deleted. No ~COMMAND exclusion so
+        # an edited-in `/setkey <key>` is caught too (CommandHandler ignores edits).
+        edited_secret_filter = filters.UpdateType.EDITED_MESSAGE & (filters.TEXT | filters.CAPTION)
+        self.application.add_handler(MessageHandler(edited_secret_filter, self.on_edited_message), group=1)
 
         text_or_caption = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
         self.application.add_handler(MessageHandler(text_or_caption, self.on_message), group=1)

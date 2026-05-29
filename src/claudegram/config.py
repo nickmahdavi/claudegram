@@ -19,6 +19,9 @@ class Config(BaseSettings):
     ignore_prefix: str | None = None
     system_prefix: str = "<System>"
     admin_user_ids: Annotated[frozenset[int], NoDecode] = Field(default_factory=frozenset)
+    # urlsafe-base64 32-byte Fernet key. Missing/malformed => credential storage
+    # disabled (BYO-key/OAuth commands refuse, the admin pool still works).
+    credential_enc_key: str | None = None
 
     @classmethod
     def load(cls) -> Self:

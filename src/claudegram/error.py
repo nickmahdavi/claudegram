@@ -82,6 +82,49 @@ def user_reply(cls: ErrorClass) -> str:
     return USER_ERROR_REPLIES.get(cls, USER_ERROR_REPLIES[ErrorClass.UNKNOWN])
 
 
+# ---- credential-related user-facing messages ---------------------------
+# (kept parse_mode-free at the call sites, per the bot's no-markdown-on-
+# user-controlled-content convention; these are plain text.)
+
+def no_credential_reply(is_private: bool) -> str:
+    """Polite refusal when a request resolves to no usable credential."""
+    if is_private:
+        return (
+            "I can't answer without credentials to bill this to. Send /setkey "
+            "<your-anthropic-key> here in this DM (I'll delete the message), or "
+            "ask an admin to add you to the shared pool."
+        )
+    return (
+        "I can't answer here without credentials to bill this to. DM me /setkey "
+        "<your-anthropic-key>, or ask an admin to add you to the shared pool."
+    )
+
+
+def credential_broken_reply() -> str:
+    """When we couldn't even build a client from a stored credential."""
+    return (
+        "Your stored credential couldn't be used. Try /forgetkey then /setkey "
+        "again, or check /keystatus."
+    )
+
+
+# User-owned credential failures, attributed to the user (never the bot/pool).
+_USER_FAILURE_REPLIES: dict[ErrorClass, str] = {
+    ErrorClass.AUTH: "Your API key was rejected (invalid or expired). Re-add it with /setkey; see /keystatus.",
+    ErrorClass.CREDIT: "Your account is out of API credits. Top up, then try again.",
+    # TRANSIENT covers a 429 on the user's OWN account (their rate limit) as well
+    # as Anthropic-wide blips — so don't promise it's "just temporary".
+    ErrorClass.TRANSIENT: "Temporary problem on your credential — possibly your account's rate limit. Try again shortly.",
+}
+
+
+def user_credential_failed_reply(err_class: ErrorClass) -> str:
+    """Reply for a failure on the *user's own* credential. AUTH/CREDIT get
+    credential-specific wording; everything else falls back to the generic
+    per-class reply (transient, etc.)."""
+    return _USER_FAILURE_REPLIES.get(err_class, user_reply(err_class))
+
+
 def admin_failure_dm(cls: ErrorClass, chat_id: int, count: int, desc: str) -> str:
     """Render the admin DM body for a failure streak. UNKNOWN is the fallback template."""
     template = ADMIN_FAILURE_DMS.get(cls, ADMIN_FAILURE_DMS[ErrorClass.UNKNOWN])
