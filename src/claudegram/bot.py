@@ -822,7 +822,7 @@ class Bot:
         else:
             await self._say(ctx, "Already inactive here.")
 
-    @command()
+    @command(admin="in_groups")
     async def command_reset(self, ctx: CommandCtx):
         async with self.store.lock(ctx.chat_id):
             window, file, context = self.store.reset(ctx.chat_id)
@@ -839,7 +839,7 @@ class Bot:
         suffix = " (admin)" if ctx.is_admin else ""
         await self._say(ctx, f"Your telegram user id: `{ctx.user.id}`{suffix}")
 
-    @command()
+    @command(admin="in_groups")
     async def command_save(self, ctx: CommandCtx):
         async with self.store.lock(ctx.chat_id):
             n = self.store.persist(ctx.chat_id)

@@ -56,9 +56,9 @@ to begin recording your messages or speaking.
 | `/save` | Back up unsaved messages to disk. | Group |
 | `/model [name]` | Show or set the model for this chat. | Group |
 | `/load` | Replace history from a Telegram Desktop `result.json`. | Group |
+| `/billing` | Set who pays in this group. | Group |
 | `/tz [name]` | Show or set your timezone (IANA name, e.g. `America/New_York`). | N |
 | `/whoami` | Show your Telegram user ID. | N |
 | `/help` | Show available commands. | N |
 | `/setkey`, `/forgetkey`, `/keystatus` | Manage your own stored Anthropic key. | N |
 | `/allow`, `/disallow`, `/poollist` | Manage the shared-pool user list. | Y |
-| `/billing` | Set who pays in this group. | Y |
