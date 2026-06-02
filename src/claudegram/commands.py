@@ -23,6 +23,30 @@ class ActiveChat(filters.MessageFilter):
         return self.store.is_active(message.chat_id)
 
 
+class CaptionCommand(filters.MessageFilter):
+    """A media caption that *starts* with a bot command (e.g. a document
+    captioned `/load`).
+
+    PTB's `filters.COMMAND` only inspects `message.entities` (text), never
+    `message.caption_entities`, so a caption-command isn't a COMMAND to it.
+    That means `~filters.COMMAND` lets a `/load`-captioned upload fall through
+    to on_message, which would store the literal "/load" as chat history right
+    after command_load (group 0) replaced it. Compose `& ~CaptionCommand()`
+    into the on_message filter to exclude these, mirroring how `~filters.COMMAND`
+    excludes text-commands."""
+
+    def __init__(self):
+        super().__init__(name="CaptionCommand")
+
+    def filter(self, message: telegram.Message) -> bool:
+        entities = message.caption_entities or []
+        return bool(
+            entities
+            and entities[0].type == telegram.MessageEntity.BOT_COMMAND
+            and entities[0].offset == 0
+        )
+
+
 class MentionsMe(filters.MessageFilter):
     """A text/caption @mention whose handle is *this* bot's username.
 

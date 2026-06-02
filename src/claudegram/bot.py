@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from .commands import ActiveChat, MentionsMe, NotIgnored, RepliesToMe
+from .commands import ActiveChat, CaptionCommand, MentionsMe, NotIgnored, RepliesToMe
 from .config import Config
 from .credentials import (
     USER_OWNED_KINDS,
@@ -1278,7 +1278,13 @@ class Bot:
         edited_secret_filter = filters.UpdateType.EDITED_MESSAGE & (filters.TEXT | filters.CAPTION)
         self.application.add_handler(MessageHandler(edited_secret_filter, self.on_edited_message), group=1)
 
-        text_or_caption = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND
+        # ~filters.COMMAND excludes text-commands; ~CaptionCommand() excludes the
+        # caption equivalent (filters.COMMAND ignores caption_entities), so a
+        # `/load`-captioned upload — already handled by command_load in group 0 —
+        # doesn't also fall through here and get stored as the literal "/load".
+        # Shared by on_message (group 1) and on_ping (group 2): neither should
+        # see a caption-command.
+        text_or_caption = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & ~CaptionCommand()
         self.application.add_handler(MessageHandler(text_or_caption, self.on_message), group=1)
 
         # on_ping gating is fully declarative: the chat must be active, the
