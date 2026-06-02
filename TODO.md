@@ -7,6 +7,8 @@
 - [ ] bot doesn't accumulate messages properly--
     - [ ] a long reply from the user splits into many chunks, and claude responds to all
     - [ ] multiple claude replies might send out-of-order
+- [ ] repo currently has a lot of comment bloat from agents
+    - [ ] same with some command / system text
 
 ## Claude wants
 

@@ -125,6 +125,28 @@ def user_credential_failed_reply(err_class: ErrorClass) -> str:
     return _USER_FAILURE_REPLIES.get(err_class, user_reply(err_class))
 
 
+# Same failures, but attributed in the third person to a *designated* payer who
+# is not the user who triggered the ping (CHAT_DESIGNATED billing). The "your"
+# wording above would address the triggerer, who may not even own a key and
+# whose account is fine — so name the payer and drop the second person.
+_DESIGNATED_FAILURE_REPLIES: dict[ErrorClass, str] = {
+    ErrorClass.AUTH: "{payer}'s API key (billed for this chat) was rejected (invalid or expired). They can re-add it with /setkey.",
+    ErrorClass.CREDIT: "{payer}'s account (billed for this chat) is out of API credits. They'll need to top up.",
+    ErrorClass.TRANSIENT: "Temporary problem on {payer}'s credential (billed for this chat) — possibly their account's rate limit. Try again shortly.",
+}
+
+
+def designated_credential_failed_reply(err_class: ErrorClass, payer: str) -> str:
+    """Reply for a failure on the chat's *designated* payer's credential when a
+    different user triggered the ping. Names the payer instead of saying
+    "your", so the triggerer isn't told their (possibly nonexistent) key
+    failed. Falls back to the generic per-class reply for unclassified errors."""
+    template = _DESIGNATED_FAILURE_REPLIES.get(err_class)
+    if template is None:
+        return user_reply(err_class)
+    return template.format(payer=payer)
+
+
 def admin_failure_dm(cls: ErrorClass, chat_id: int, count: int, desc: str) -> str:
     """Render the admin DM body for a failure streak. UNKNOWN is the fallback template."""
     template = ADMIN_FAILURE_DMS.get(cls, ADMIN_FAILURE_DMS[ErrorClass.UNKNOWN])

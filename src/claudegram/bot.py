@@ -36,6 +36,7 @@ from .error import (
     admin_recovery_dm,
     classify_error,
     credential_broken_reply,
+    designated_credential_failed_reply,
     no_credential_reply,
     user_credential_failed_reply,
     user_reply,
@@ -713,15 +714,28 @@ class Bot:
         # pool key. Out-of-credit (402) is the most common BYO failure and the
         # easiest to misattribute as "the bot is down".
         if cred.kind in USER_OWNED_KINDS:
+            # Attribute to the credential's OWNER (cred.user_id), not the user
+            # who triggered the ping. In CHAT_DESIGNATED billing the payer is
+            # the chat's designated user, who may be someone other than the
+            # triggerer; logging incoming.sender here would point at the wrong
+            # account.
+            triggered_by_payer = incoming.sender.user_id == cred.user_id
             logger.warning(
-                "User-owned credential failure (user=%s, kind=%s, class=%s, desc=%s)",
-                incoming.sender.user_id,
+                "User-owned credential failure (payer=%s, triggered_by=%s, kind=%s, class=%s, desc=%s)",
+                cred.user_id, incoming.sender.user_id,
                 cred.kind.value, err_class.value, err_desc,
             )
+            if triggered_by_payer:
+                text = user_credential_failed_reply(err_class)
+            else:
+                # Designated payer != triggerer: name the payer instead of
+                # telling the triggerer "your key failed" (theirs is fine, or
+                # they have none). The reply is public in the group, so this
+                # also routes the actionable info to the person who can fix it.
+                payer = self.store.resolve_user(cred.user_id).display_name
+                text = designated_credential_failed_reply(err_class, payer)
             try:
-                await reply(
-                    f"{self.config.system_prefix} {user_credential_failed_reply(err_class)}"
-                )
+                await reply(f"{self.config.system_prefix} {text}")
             except Exception:
                 logger.exception("Failed to send per-user credential error reply in chat %s", chat_id)
             return
