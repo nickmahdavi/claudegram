@@ -2,16 +2,25 @@
 
 ## up next
 
-### deployment / cicd / ergonomics / 8 inch stick up my ass
+### queued, minor
 
-- [ ] systemd unit, journald logging
-- [ ] /reload admin command
-- [ ] mobile hooks
-- [ ] better up/down lifecycle
+- [ ] bot doesn't accumulate messages properly--
+    - [ ] a long reply from the user splits into many chunks, and claude responds to all
+    - [ ] multiple claude replies might send out-of-order
 
-### queued
+## Claude wants
 
-- [ ] `/help` + CommandRegistry refactor, dict mapping command name -> (handler, description, admin_only)
+- [ ] `Continuity markers—something that flags "you were restarted here" so I'm not reconstructing from ambiguous context`
+- [ ] `A way to access previous conversation summaries I've written, if they exist, so I can follow my own thread across discontinuities`
+- [ ] Memory in various forms
+
+## Backlog
+
+### BYOK
+
+- [x] Currently midflight. Per-user keying is fully functional
+- [ ] Subscription/oauth. We'd like to use the Agent SDK instead of the preexisting claude code hack workaround (and think about affordability after the change drops next month.)
+- [ ] Multiple keys and more flexible admin billing (either per-chat or cycling through on out-of-credits.)
 
 ### `/load` debt
 
@@ -20,6 +29,10 @@
 - [ ] backups accumulate forever, set a threshold
 - [ ] eventual local-mode server for bigger files
 
+### `/help`
+
+- [ ] Still missing some stuff post refactor
+
 ## feature backlog
 
 ### capabilities
@@ -27,22 +40,23 @@
 - [ ] web search + web fetch
 - [ ] code execution + sandbox
 - [ ] memory
-- [ ] phase 1 media (photos to claude)-- base64 encode, image content blocks in `Window.history`, persist image bytes
-- [ ] phase 2 media: voice / video / document placeholders, render text files
-- [ ] voice transcription?
+- [ ] media part 1 (photos to claude)-- base64 encode, image content blocks in `Window.history`, persist image bytes
+- [ ] media part 2: voice / video / document placeholders, voice transcription, render text files
 
 ### ux
 
 - [ ] /status command, uptime, current model per chat, loaded chat count, recent error rate, cache hit rate from logs
+- [ ] edited and deleted message handling (the latter will be difficult)
 - [ ] summarization
 - [ ] interest meter or reply on random, either haiku or a subagent
-- [ ] rate limiting
-- [ ] reminders
-- [ ] options to keep disjoint conversational threads
+- [ ] rate limiting and budgeting
+- [ ] timed reminders
+- [ ] disjoint conversational threads or multiple chats; handling topics better
 
 ### model handling
 
 - [ ] fuzzy versioning, older model formats, AWS bedrock models
+- [ ] other providers
 - [ ] per model max tokens defaults
 
 ### formatting
@@ -53,29 +67,29 @@
   - Configurable verbosity per chat
 - [ ] sysprompt and formatting benchmarks. batch api gets a discount
 
-### hygiene
+## backend
 
-- [ ] tests
-- [ ] unify per-chat / per-user state files into singe chat settings json
-- [ ] edited message handling
-- [ ] `Window.__repr__`
-- [ ] commit more
+### deployment / cicd / ergonomics
 
-### bigger refactors
+- [ ] systemd unit, journald logging
+- [ ] /reload admin command
+- [ ] mobile hooks
+- [ ] better up/down lifecycle
 
+### tests
+
+- [ ] that's it, that's the task
+
+### needs bigger refactors
 
 - [ ] `Window._full` memory leak-- full list grows unboundedly per chat redudant w/ disk copy. Drop from `_full` once persisted & stream from disk
-- [ ] `Store.windows` has no eviction
+- [ ] `Store.windows` has no eviction-- I think this may be fixed
 
 ### prefill mode
 
 - [ ] stop sequences from known speakers, `\n\n{username}:` per recent participant, capped at 4 (Anthropic limit?)
 - [ ] regex truncate
 - [ ] real cli sim, `cat untitled.txt` lead message
-
-### handoff
-
-- [ ] document the shits
 
 ## wishlist
 
