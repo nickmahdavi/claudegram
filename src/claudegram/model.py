@@ -100,7 +100,7 @@ def get_prompt(
         user_tz_directory=user_tz_directory,
     )
 
-_EPHEMERAL: CacheControlEphemeralParam = {"type": "ephemeral"}
+_EPHEMERAL: CacheControlEphemeralParam = {"type": "ephemeral", "ttl": "1h"}
 
 
 def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessageParam]:
@@ -140,7 +140,7 @@ async def complete(client: AsyncClient, model: ModelParam, system: str, messages
     #      minimum-cacheable-size, in which case this marker is silently
     #      dropped -- harmless.
     #   2. End of the last message: caches the full conversation prefix.
-    #      Hits during a burst of pings within the 5-min TTL, until Window
+    #      Hits during a burst of pings within the 1-hour TTL, until Window
     #      evicts and the prefix shifts.
     # Replaces the top-level `cache_control={"type":"ephemeral"}` kwarg, which
     # placed only the second marker and lost the system-prompt cache.
