@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Optional
 from string import Template
 
+import anthropic
 from anthropic import AsyncClient
 from anthropic.types import (
     CacheControlEphemeralParam,
@@ -131,6 +133,8 @@ def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessagePa
     return out
 
 
+_RETRYABLE = (anthropic.APIConnectionError, anthropic.APITimeoutError, anthropic.InternalServerError)
+
 async def complete(
     client: AsyncClient,
     model: ModelParam,
@@ -138,6 +142,8 @@ async def complete(
     messages: list[MessageParam],
     max_tokens: int,
     mcp_servers: Optional[list[dict]] = None,
+    max_retries: int = 3,
+    retry_delay: float = 3.0,
 ) -> ClaudeResponse:
     # Two explicit cache breakpoints, used together:
     #   1. End of the system prompt: small always-on cache. Survives Window
@@ -156,22 +162,33 @@ async def complete(
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
-    if mcp_servers:
-        response = await client.beta.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-            mcp_servers=mcp_servers,  # type: ignore[arg-type]
-            betas=["mcp-client-2025-04-04"],
-        )
-    else:
-        response = await client.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-        )
+    for attempt in range(max_retries + 1):
+        try:
+            if mcp_servers:
+                response = await client.beta.messages.create(
+                    model=model,
+                    system=system_blocks,
+                    messages=cached_messages,
+                    max_tokens=max_tokens,
+                    mcp_servers=mcp_servers,  # type: ignore[arg-type]
+                    betas=["mcp-client-2025-04-04"],
+                )
+            else:
+                response = await client.messages.create(
+                    model=model,
+                    system=system_blocks,
+                    messages=cached_messages,
+                    max_tokens=max_tokens,
+                )
+            break
+        except _RETRYABLE as exc:
+            if attempt == max_retries:
+                raise
+            logger.warning(
+                "Completion attempt %d/%d failed (%s: %s); retrying in %.0fs",
+                attempt + 1, max_retries + 1, type(exc).__name__, exc, retry_delay,
+            )
+            await asyncio.sleep(retry_delay)
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
     text = "".join(text_parts)
