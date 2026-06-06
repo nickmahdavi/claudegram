@@ -44,6 +44,7 @@ from .error import (
 from .identity import UserInfo
 from .importer import parse_export
 from .message import UTC, Forward, Message, Reply
+from .mcp import McpTokenManager
 from .model import MODEL_ALIASES, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
 from .transport import CommandCtx, Incoming, Outgoing
@@ -259,6 +260,16 @@ class Bot:
         # for any direct use (e.g. legacy call sites). Per-request clients are
         # resolved via self.credentials.client_for(...).
         self.client = credentials.pool_client
+
+        self.mcp_tokens: Optional[McpTokenManager] = (
+            McpTokenManager(
+                token_url=config.mcp_token_url,
+                client_id=config.mcp_client_id,
+                client_secret=config.mcp_client_secret,
+            )
+            if config.mcp_enabled
+            else None
+        )
         self.application = (
             Application.builder()
             .token(self.config.telegram_bot_token)
@@ -656,6 +667,17 @@ class Bot:
 
         messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
 
+        mcp_servers = None
+        if self.mcp_tokens is not None:
+            token = await self.mcp_tokens.get_token()
+            if token is not None:
+                mcp_servers = [{
+                    "type": "url",
+                    "url": self.config.mcp_server_url,
+                    "name": self.config.mcp_server_name,
+                    "authorization_token": token,
+                }]
+
         async with keep_typing(bot, incoming.chat_id):
             try:
                 completion = await complete(
@@ -663,7 +685,8 @@ class Bot:
                     model=chat_model,
                     system=system,
                     messages=messages,
-                    max_tokens=self.config.reply_budget
+                    max_tokens=self.config.reply_budget,
+                    mcp_servers=mcp_servers,
                 )
                 # window_tokens is len // 4 + 5 + (overhead) per message. Empirically the ratio
                 # here is about 1.05, but it's different for opus 4.7 and likely later

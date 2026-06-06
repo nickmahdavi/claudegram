@@ -131,7 +131,14 @@ def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessagePa
     return out
 
 
-async def complete(client: AsyncClient, model: ModelParam, system: str, messages: list[MessageParam], max_tokens: int) -> ClaudeResponse:
+async def complete(
+    client: AsyncClient,
+    model: ModelParam,
+    system: str,
+    messages: list[MessageParam],
+    max_tokens: int,
+    mcp_servers: Optional[list[dict]] = None,
+) -> ClaudeResponse:
     # Two explicit cache breakpoints, used together:
     #   1. End of the system prompt: small always-on cache. Survives Window
     #      evictions (system content is independent of the working set as long
@@ -149,14 +156,24 @@ async def complete(client: AsyncClient, model: ModelParam, system: str, messages
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
-    response = await client.messages.create(
-        model=model,
-        system=system_blocks,
-        messages=cached_messages,
-        max_tokens=max_tokens,
-    )
+    if mcp_servers:
+        response = await client.beta.messages.create(
+            model=model,
+            system=system_blocks,
+            messages=cached_messages,
+            max_tokens=max_tokens,
+            mcp_servers=mcp_servers,  # type: ignore[arg-type]
+            betas=["mcp-client-2025-04-04"],
+        )
+    else:
+        response = await client.messages.create(
+            model=model,
+            system=system_blocks,
+            messages=cached_messages,
+            max_tokens=max_tokens,
+        )
 
-    text_parts = [b.text for b in response.content if isinstance(b, TextBlock)]
+    text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
     text = "".join(text_parts)
     block_types = [getattr(b, "type", "?") for b in response.content]
     usage = response.usage
