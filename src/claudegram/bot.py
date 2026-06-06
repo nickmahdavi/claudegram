@@ -664,6 +664,8 @@ class Bot:
             partner=partner,
             tz_directory=tz_directory
         )
+        if self.config.mcp_enabled and self.config.mcp_system_prompt:
+            system = f"{system}\n\n{self.config.mcp_system_prompt}"
 
         messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
 
