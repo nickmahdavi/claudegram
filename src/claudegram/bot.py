@@ -45,7 +45,7 @@ from .identity import UserInfo
 from .importer import parse_export
 from .message import UTC, Forward, Message, Reply
 from .mcp import McpTokenManager
-from .model import MODEL_ALIASES, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
+from .model import MODEL_ALIASES, TRANSIENT_ERRORS, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
 from .transport import CommandCtx, Incoming, Outgoing
 from .store import Store
@@ -688,19 +688,52 @@ class Bot:
                     max_tokens=self.config.reply_budget,
                     mcp_servers=mcp_servers,
                 )
-                # window_tokens is len // 4 + 5 + (overhead) per message. Empirically the ratio
-                # here is about 1.05, but it's different for opus 4.7 and likely later
-                # models, so good to keep it around
-                ratio = completion.true_input / window_tokens if window_tokens else float("nan")
-                logger.info(
-                    "Token usage for %s: estimated=%d actual=%d (ratio=%.2f) "\
-                    "[uncached=%d cache_write=%d cache_read=%d output=%d]",
-                    chat_model, window_tokens, completion.true_input, ratio,
-                    completion.input_tokens, completion.cache_write, completion.cache_read, completion.output_tokens,
-                )
+            except TRANSIENT_ERRORS as exc:
+                if mcp_servers is None:
+                    await self._handle_completion_error(incoming, reply, exc, cred)
+                    return
+                # MCP server unreachable after all retries — fall back to a
+                # completion without tools, but tell Claude what happened so he
+                # can acknowledge it rather than silently losing persistence.
+                logger.warning("MCP unavailable after retries; falling back to non-MCP completion: %s", exc)
+                await reply(bot, Outgoing(
+                    text="Memory tools temporarily unavailable — continuing without them.",
+                    system=True,
+                ))
+                fallback_messages = list(messages) + [{
+                    "role": "user",
+                    "content": (
+                        "[System: The memory filesystem is currently unreachable "
+                        "(connection error after retries). You cannot read or write "
+                        "memory files for this response.]"
+                    ),
+                }]
+                try:
+                    completion = await complete(
+                        client=client,
+                        model=chat_model,
+                        system=system,
+                        messages=fallback_messages,
+                        max_tokens=self.config.reply_budget,
+                        mcp_servers=None,
+                    )
+                except Exception as fallback_exc:
+                    await self._handle_completion_error(incoming, reply, fallback_exc, cred)
+                    return
             except Exception as exc:
                 await self._handle_completion_error(incoming, reply, exc, cred)
                 return
+
+            # window_tokens is len // 4 + 5 + (overhead) per message. Empirically the ratio
+            # here is about 1.05, but it's different for opus 4.7 and likely later
+            # models, so good to keep it around
+            ratio = completion.true_input / window_tokens if window_tokens else float("nan")
+            logger.info(
+                "Token usage for %s: estimated=%d actual=%d (ratio=%.2f) "\
+                "[uncached=%d cache_write=%d cache_read=%d output=%d]",
+                chat_model, window_tokens, completion.true_input, ratio,
+                completion.input_tokens, completion.cache_write, completion.cache_read, completion.output_tokens,
+            )
 
         # Only a POOL (bot-key) success clears the chat's failure streak.
         # Clearing it on a user-key success would let one BYO user mask an

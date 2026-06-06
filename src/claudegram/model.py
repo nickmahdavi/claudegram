@@ -133,7 +133,7 @@ def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessagePa
     return out
 
 
-_RETRYABLE = (anthropic.APIConnectionError, anthropic.APITimeoutError, anthropic.InternalServerError)
+TRANSIENT_ERRORS = (anthropic.APIConnectionError, anthropic.APITimeoutError, anthropic.InternalServerError)
 
 async def complete(
     client: AsyncClient,
@@ -181,7 +181,7 @@ async def complete(
                     max_tokens=max_tokens,
                 )
             break
-        except _RETRYABLE as exc:
+        except TRANSIENT_ERRORS as exc:
             if attempt == max_retries:
                 raise
             logger.warning(
