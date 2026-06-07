@@ -422,9 +422,8 @@ class Bot:
 
     def _build_system(self, base: str) -> str:
         rendered = self._render_changelog()
-        if rendered:
-            return f"{base}\n\n{rendered}"
-        return base
+        changelog = rendered if rendered else "(no entries yet)"
+        return f"{base}\n\n— Changelog —\n{changelog}"
 
     def _base_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Base system prompt for this chat, without the changelog."""
@@ -1302,7 +1301,7 @@ class Bot:
         if rendered:
             changelog_section = f"\n\n— Changelog —\n{rendered}"
         else:
-            changelog_section = "\n\n— Changelog —\n(empty)"
+            changelog_section = "\n\n— Changelog —\n(no entries yet)"
         await self._say(ctx, base + changelog_section, markdown=False)
 
     @command(admin="always")
