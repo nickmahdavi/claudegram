@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -142,8 +141,6 @@ async def complete(
     messages: list[MessageParam],
     max_tokens: int,
     mcp_servers: Optional[list[dict]] = None,
-    max_retries: int = 3,
-    retry_delay: float = 3.0,
 ) -> ClaudeResponse:
     # Two explicit cache breakpoints, used together:
     #   1. End of the system prompt: small always-on cache. Survives Window
@@ -162,33 +159,24 @@ async def complete(
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
-    for attempt in range(max_retries + 1):
-        try:
-            if mcp_servers:
-                response = await client.beta.messages.create(
-                    model=model,
-                    system=system_blocks,
-                    messages=cached_messages,
-                    max_tokens=max_tokens,
-                    mcp_servers=mcp_servers,  # type: ignore[arg-type]
-                    betas=["mcp-client-2025-04-04"],
-                )
-            else:
-                response = await client.messages.create(
-                    model=model,
-                    system=system_blocks,
-                    messages=cached_messages,
-                    max_tokens=max_tokens,
-                )
-            break
-        except TRANSIENT_ERRORS as exc:
-            if attempt == max_retries:
-                raise
-            logger.warning(
-                "Completion attempt %d/%d failed (%s: %s); retrying in %.0fs",
-                attempt + 1, max_retries + 1, type(exc).__name__, exc, retry_delay,
-            )
-            await asyncio.sleep(retry_delay)
+    if mcp_servers:
+        response = await client.beta.messages.create(
+            model=model,
+            system=system_blocks,
+            messages=cached_messages,
+            max_tokens=max_tokens,
+            mcp_servers=mcp_servers,  # type: ignore[arg-type]
+            betas=["mcp-client-2025-04-04"],
+            max_retries=3,
+        )
+    else:
+        response = await client.messages.create(
+            model=model,
+            system=system_blocks,
+            messages=cached_messages,
+            max_tokens=max_tokens,
+            max_retries=3,
+        )
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
     text = "".join(text_parts)
