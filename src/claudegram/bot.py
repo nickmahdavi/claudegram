@@ -727,16 +727,11 @@ class Bot:
                 # can acknowledge it rather than silently losing persistence.
                 logger.warning("MCP unavailable after retries; falling back to non-MCP completion: %s", exc)
                 await reply(f"{self.config.system_prefix} Memory tools temporarily unavailable — continuing without them.")
-                fallback_system = (
-                    system + "\n\n[System: The memory filesystem is currently unreachable "
-                    "(connection error after retries). You cannot read or write "
-                    "memory files for this response.]"
-                )
                 try:
                     completion = await complete(
                         client=client,
                         model=chat_model,
-                        system=fallback_system,
+                        system=system,
                         messages=messages,
                         max_tokens=self.config.reply_budget,
                         mcp_servers=None,
