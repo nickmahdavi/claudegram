@@ -426,10 +426,8 @@ class Bot:
             return f"{base}\n\n{rendered}"
         return base
 
-    def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
-        """Rebuild the system prompt this chat would be sent right now, for the view
-        log header. Mirrors on_ping's construction (mode, model pref, partner tz /
-        group tz directory) so the logged 'System:' matches what the model sees."""
+    def _base_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
+        """Base system prompt for this chat, without the changelog."""
         prompt_mode = PromptMode.CHAT_PRIVATE if is_private else PromptMode.CHAT
         prompt_template = Template(SYSTEM_PROMPTS.get(prompt_mode, ""))
         chat_model = self.store.get_model_pref(chat_id) or self.config.default_claude_model
@@ -439,13 +437,17 @@ class Bot:
             known = {m.user_id for m in snapshot}
             known.discard(self.me.user_id)
             tz_directory = build_tz_directory(known, self.store.resolve_user)
-        return self._build_system(get_prompt(
+        return get_prompt(
             prompt_template=prompt_template,
             model=chat_model,
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory,
-        ))
+        )
+
+    def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
+        """Full system prompt as the model sees it (base + changelog)."""
+        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id))
 
     async def _write_chat_view(
         self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
@@ -1292,7 +1294,7 @@ class Bot:
     @command(admin="always")
     async def command_showprompt(self, ctx: CommandCtx):
         window = self.store.window(ctx.chat_id)
-        system = self._view_system_prompt(
+        base = self._base_prompt(
             ctx.chat_id, window.snapshot(), ctx.is_private,
             ctx.user.id if ctx.is_private else None,
         )
@@ -1301,7 +1303,7 @@ class Bot:
             changelog_section = f"\n\n— Changelog —\n{rendered}"
         else:
             changelog_section = "\n\n— Changelog —\n(empty)"
-        await self._say(ctx, system + changelog_section, markdown=False)
+        await self._say(ctx, base + changelog_section, markdown=False)
 
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
