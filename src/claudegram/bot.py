@@ -1306,9 +1306,25 @@ class Bot:
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
         if not ctx.args:
-            await self._say(ctx, "Usage: /appendprompt <text>", markdown=False)
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
             return
-        entry = {"timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00"), "text": " ".join(ctx.args)}
+        args = list(ctx.args)
+        timestamp = None
+        for fmt, n in [("%Y-%m-%d %H:%M", 2), ("%Y-%m-%d", 1)]:
+            if len(args) > n - 1:
+                try:
+                    dt = datetime.strptime(" ".join(args[:n]), fmt)
+                    timestamp = dt.strftime("%Y-%m-%d %H:%M +00")
+                    args = args[n:]
+                    break
+                except ValueError:
+                    pass
+        if timestamp is None:
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00")
+        if not args:
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
+            return
+        entry = {"timestamp": timestamp, "text": " ".join(args)}
         self._prompt_changelog.append(entry)
         self._save_prompt_changelog()
         await self._say(ctx, f"Appended. Changelog is now:\n\n{self._render_changelog()}", markdown=False)
