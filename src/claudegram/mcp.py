@@ -74,9 +74,7 @@ class McpTokenManager:
                 )
                 logger.info("Obtained MCP access token (expires in %ds)", expires_in)
         except httpx.HTTPStatusError as exc:
-            logger.error("Failed to obtain MCP access token (HTTP %s %s); proceeding without MCP",
+            logger.error("Failed to refresh MCP access token (HTTP %s %s); keeping existing token if valid",
                          exc.response.status_code, exc.response.reason_phrase)
-            self._token = None
         except Exception as exc:
-            logger.error("Failed to obtain MCP access token (%s); proceeding without MCP", type(exc).__name__)
-            self._token = None
+            logger.error("Failed to refresh MCP access token (%s); keeping existing token if valid", type(exc).__name__)
