@@ -29,7 +29,6 @@ class Config(BaseSettings):
     mcp_server_name: str | None = None   # name passed to the Anthropic API
     mcp_client_id: str | None = None
     mcp_client_secret: str | None = None
-    mcp_system_prompt: str | None = None # appended to system prompt when MCP is active
 
     @property
     def mcp_enabled(self) -> bool:
