@@ -418,7 +418,7 @@ class Bot:
         self._prompt_changelog_path.write_text(text + "\n" if text else "", encoding="utf-8")
 
     def _render_changelog(self) -> str:
-        return "\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
+        return "\n\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
 
     def _build_system(self, base: str) -> str:
         rendered = self._render_changelog()
