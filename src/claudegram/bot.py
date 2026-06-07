@@ -1,9 +1,11 @@
 import asyncio
 import functools
+import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from string import Template
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -280,6 +282,9 @@ class Bot:
 
         self.start_time = datetime.now(UTC)
 
+        self._prompt_changelog_path = Path(config.data_dir) / "prompt_changelog.jsonl"
+        self._prompt_changelog: list[dict] = self._load_prompt_changelog()
+
         # View-log bookkeeping: per-chat throttle clock + warn-once dedupe so a
         # persistently failing view write (e.g. unwritable log_dir) is surfaced
         # once instead of on every message.
@@ -397,6 +402,30 @@ class Bot:
         self._view_last_write[chat_id] = now
         return True
 
+    def _load_prompt_changelog(self) -> list[dict]:
+        try:
+            lines = self._prompt_changelog_path.read_text(encoding="utf-8").splitlines()
+            return [json.loads(line) for line in lines if line.strip()]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.exception("Failed to load prompt changelog from %s", self._prompt_changelog_path)
+            return []
+
+    def _save_prompt_changelog(self) -> None:
+        self._prompt_changelog_path.parent.mkdir(parents=True, exist_ok=True)
+        text = "\n".join(json.dumps(entry) for entry in self._prompt_changelog)
+        self._prompt_changelog_path.write_text(text + "\n" if text else "", encoding="utf-8")
+
+    def _render_changelog(self) -> str:
+        return "\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
+
+    def _build_system(self, base: str) -> str:
+        rendered = self._render_changelog()
+        if rendered:
+            return f"{base}\n\n{rendered}"
+        return base
+
     def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Rebuild the system prompt this chat would be sent right now, for the view
         log header. Mirrors on_ping's construction (mode, model pref, partner tz /
@@ -410,13 +439,13 @@ class Bot:
             known = {m.user_id for m in snapshot}
             known.discard(self.me.user_id)
             tz_directory = build_tz_directory(known, self.store.resolve_user)
-        return get_prompt(
+        return self._build_system(get_prompt(
             prompt_template=prompt_template,
             model=chat_model,
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory,
-        )
+        ))
 
     async def _write_chat_view(
         self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
@@ -657,13 +686,13 @@ class Bot:
             known_users.discard(self.me.user_id)  # don't show me in my own directory
             tz_directory = build_tz_directory(known_users, self.store.resolve_user)
 
-        system = get_prompt(
+        system = self._build_system(get_prompt(
             prompt_template=prompt_template,
             model=chat_model,
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory
-        )
+        ))
 
         messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
 
@@ -1260,6 +1289,40 @@ class Bot:
         lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
         await self._say(ctx, "\n".join(lines), markdown=False)
 
+    @command(admin="always")
+    async def command_showprompt(self, ctx: CommandCtx):
+        window = self.store.window(ctx.chat_id)
+        system = self._view_system_prompt(
+            ctx.chat_id, window.snapshot(), ctx.is_private,
+            ctx.user.id if ctx.is_private else None,
+        )
+        rendered = self._render_changelog()
+        if rendered:
+            changelog_section = f"\n\n— Changelog —\n{rendered}"
+        else:
+            changelog_section = "\n\n— Changelog —\n(empty)"
+        await self._say(ctx, system + changelog_section, markdown=False)
+
+    @command(admin="always")
+    async def command_appendprompt(self, ctx: CommandCtx):
+        if not ctx.args:
+            await self._say(ctx, "Usage: /appendprompt <text>", markdown=False)
+            return
+        entry = {"timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00"), "text": " ".join(ctx.args)}
+        self._prompt_changelog.append(entry)
+        self._save_prompt_changelog()
+        await self._say(ctx, f"Appended. Changelog is now:\n\n{self._render_changelog()}", markdown=False)
+
+    @command(admin="always")
+    async def command_undoprompt(self, ctx: CommandCtx):
+        if not self._prompt_changelog:
+            await self._say(ctx, "Changelog is already empty.", markdown=False)
+            return
+        removed = self._prompt_changelog.pop()
+        self._save_prompt_changelog()
+        await self._say(ctx, f"Removed: [{removed['timestamp']}] {removed['text']}", markdown=False)
+
+
     @command(admin="in_groups")
     async def command_billing(self, ctx: CommandCtx):
         # DM short-circuit stays in-body: it REPLIES (not a silent drop), and
@@ -1331,6 +1394,9 @@ class Bot:
         self.application.add_handler(CommandHandler("keystatus", self.command_keystatus), group=0)
         self.application.add_handler(CommandHandler("allow", self.command_allow), group=0)
         self.application.add_handler(CommandHandler("disallow", self.command_disallow), group=0)
+        self.application.add_handler(CommandHandler("showprompt", self.command_showprompt), group=0)
+        self.application.add_handler(CommandHandler("appendprompt", self.command_appendprompt), group=0)
+        self.application.add_handler(CommandHandler("undoprompt", self.command_undoprompt), group=0)
         self.application.add_handler(CommandHandler("poollist", self.command_poollist), group=0)
         self.application.add_handler(CommandHandler("billing", self.command_billing), group=0)
 
