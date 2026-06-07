@@ -1306,12 +1306,36 @@ class Bot:
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
         if not ctx.args:
-            await self._say(ctx, "Usage: /appendprompt <text>", markdown=False)
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
             return
-        entry = {"timestamp": datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00"), "text": " ".join(ctx.args)}
+
+        words = list(ctx.args)
+        timestamp, text_start = self._parse_date_prefix(words)
+        text = " ".join(words[text_start:])
+
+        if not text:
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
+            return
+
+        entry = {"timestamp": timestamp, "text": text}
         self._prompt_changelog.append(entry)
         self._save_prompt_changelog()
         await self._say(ctx, f"Appended. Changelog is now:\n\n{self._render_changelog()}", markdown=False)
+
+    def _parse_date_prefix(self, words: list[str]) -> tuple[str, int]:
+        """Try to parse an optional YYYY-MM-DD [HH:MM] prefix from words.
+
+        Returns (timestamp_str, index_of_first_text_word). If no date is
+        found, timestamp is the current time and index is 0.
+        """
+        for fmt, n in [("%Y-%m-%d %H:%M", 2), ("%Y-%m-%d", 1)]:
+            if len(words) >= n:
+                try:
+                    dt = datetime.strptime(" ".join(words[:n]), fmt)
+                    return dt.strftime("%Y-%m-%d %H:%M +00"), n
+                except ValueError:
+                    pass
+        return datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00"), 0
 
     @command(admin="always")
     async def command_undoprompt(self, ctx: CommandCtx):
