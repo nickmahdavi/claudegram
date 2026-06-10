@@ -88,7 +88,7 @@ class CredentialStore:
         self.secrets = secrets
 
         # The shared bot key — used for POOL credentials and to validate user keys.
-        self.pool_client = AsyncClient(api_key=pool_api_key)
+        self.pool_client = AsyncClient(api_key=pool_api_key, max_retries=3)
 
         # user_id -> Credential (USER_API_KEY / OAUTH_SUBSCRIPTION only; POOL is
         # implied by membership in self._pool, never stored here).
@@ -333,7 +333,7 @@ class CredentialStore:
                 raise ValueError("USER_API_KEY credential has no secret")
             return self._cached_client(
                 cred.user_id, cred.kind, cred.secret,
-                lambda: AsyncClient(api_key=cred.secret),
+                lambda: AsyncClient(api_key=cred.secret, max_retries=3),
             )
         if cred.kind == CredentialKind.OAUTH_SUBSCRIPTION:
             # Routed through the Agent SDK, not messages.create — a separate
