@@ -167,7 +167,6 @@ async def complete(
             max_tokens=max_tokens,
             mcp_servers=mcp_servers,  # type: ignore[arg-type]
             betas=["mcp-client-2025-04-04"],
-            max_retries=3,
         )
     else:
         response = await client.messages.create(
@@ -175,7 +174,6 @@ async def complete(
             system=system_blocks,
             messages=cached_messages,
             max_tokens=max_tokens,
-            max_retries=3,
         )
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
