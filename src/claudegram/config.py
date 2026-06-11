@@ -23,6 +23,18 @@ class Config(BaseSettings):
     # disabled (BYO-key/OAuth commands refuse, the admin pool still works).
     credential_enc_key: str | None = None
 
+    # MCP server. All four must be set to enable MCP tool access.
+    mcp_server_url: str | None = None    # full URL of the MCP endpoint
+    mcp_token_url: str | None = None     # full URL of the OAuth token endpoint
+    mcp_server_name: str | None = None   # name passed to the Anthropic API
+    mcp_client_id: str | None = None
+    mcp_client_secret: str | None = None
+
+    @property
+    def mcp_enabled(self) -> bool:
+        return bool(self.mcp_server_url and self.mcp_token_url and
+                    self.mcp_server_name and self.mcp_client_id and self.mcp_client_secret)
+
     @classmethod
     def load(cls) -> Self:
         return cls()  # type: ignore[call-arg]

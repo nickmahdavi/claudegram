@@ -1,9 +1,11 @@
 import asyncio
 import functools
+import json
 import logging
 import os
 import re
 import time
+from pathlib import Path
 from string import Template
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -44,7 +46,8 @@ from .error import (
 from .identity import UserInfo
 from .importer import parse_export
 from .message import UTC, Forward, Message, Reply
-from .model import MODEL_ALIASES, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
+from .mcp import McpTokenManager
+from .model import MODEL_ALIASES, TRANSIENT_ERRORS, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
 from .transport import CommandCtx, Incoming, Outgoing
 from .store import Store
@@ -259,6 +262,16 @@ class Bot:
         # for any direct use (e.g. legacy call sites). Per-request clients are
         # resolved via self.credentials.client_for(...).
         self.client = credentials.pool_client
+
+        self.mcp_tokens: Optional[McpTokenManager] = (
+            McpTokenManager(
+                token_url=config.mcp_token_url,
+                client_id=config.mcp_client_id,
+                client_secret=config.mcp_client_secret,
+            )
+            if config.mcp_enabled
+            else None
+        )
         self.application = (
             Application.builder()
             .token(self.config.telegram_bot_token)
@@ -268,6 +281,9 @@ class Bot:
         )
 
         self.start_time = datetime.now(UTC)
+
+        self._prompt_changelog_path = Path(config.data_dir) / "prompt_changelog.jsonl"
+        self._prompt_changelog: list[dict] = self._load_prompt_changelog()
 
         # View-log bookkeeping: per-chat throttle clock + warn-once dedupe so a
         # persistently failing view write (e.g. unwritable log_dir) is surfaced
@@ -386,10 +402,31 @@ class Bot:
         self._view_last_write[chat_id] = now
         return True
 
-    def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
-        """Rebuild the system prompt this chat would be sent right now, for the view
-        log header. Mirrors on_ping's construction (mode, model pref, partner tz /
-        group tz directory) so the logged 'System:' matches what the model sees."""
+    def _load_prompt_changelog(self) -> list[dict]:
+        try:
+            lines = self._prompt_changelog_path.read_text(encoding="utf-8").splitlines()
+            return [json.loads(line) for line in lines if line.strip()]
+        except FileNotFoundError:
+            return []
+        except Exception:
+            logger.exception("Failed to load prompt changelog from %s", self._prompt_changelog_path)
+            return []
+
+    def _save_prompt_changelog(self) -> None:
+        self._prompt_changelog_path.parent.mkdir(parents=True, exist_ok=True)
+        text = "\n".join(json.dumps(entry) for entry in self._prompt_changelog)
+        self._prompt_changelog_path.write_text(text + "\n" if text else "", encoding="utf-8")
+
+    def _render_changelog(self) -> str:
+        return "\n\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
+
+    def _build_system(self, base: str) -> str:
+        rendered = self._render_changelog()
+        changelog = rendered if rendered else "(no entries yet)"
+        return f"{base}\n\n— Changelog —\n{changelog}"
+
+    def _base_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
+        """Base system prompt for this chat, without the changelog."""
         prompt_mode = PromptMode.CHAT_PRIVATE if is_private else PromptMode.CHAT
         prompt_template = Template(SYSTEM_PROMPTS.get(prompt_mode, ""))
         chat_model = self.store.get_model_pref(chat_id) or self.config.default_claude_model
@@ -406,6 +443,10 @@ class Bot:
             partner=partner,
             tz_directory=tz_directory,
         )
+
+    def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
+        """Full system prompt as the model sees it (base + changelog)."""
+        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id))
 
     async def _write_chat_view(
         self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
@@ -646,15 +687,26 @@ class Bot:
             known_users.discard(self.me.user_id)  # don't show me in my own directory
             tz_directory = build_tz_directory(known_users, self.store.resolve_user)
 
-        system = get_prompt(
+        system = self._build_system(get_prompt(
             prompt_template=prompt_template,
             model=chat_model,
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory
-        )
+        ))
 
         messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
+
+        mcp_servers = None
+        if self.mcp_tokens is not None:
+            token = await self.mcp_tokens.get_token()
+            if token is not None:
+                mcp_servers = [{
+                    "type": "url",
+                    "url": self.config.mcp_server_url,
+                    "name": self.config.mcp_server_name,
+                    "authorization_token": token,
+                }]
 
         async with keep_typing(bot, incoming.chat_id):
             try:
@@ -663,21 +715,44 @@ class Bot:
                     model=chat_model,
                     system=system,
                     messages=messages,
-                    max_tokens=self.config.reply_budget
+                    max_tokens=self.config.reply_budget,
+                    mcp_servers=mcp_servers,
                 )
-                # window_tokens is len // 4 + 5 + (overhead) per message. Empirically the ratio
-                # here is about 1.05, but it's different for opus 4.7 and likely later
-                # models, so good to keep it around
-                ratio = completion.true_input / window_tokens if window_tokens else float("nan")
-                logger.info(
-                    "Token usage for %s: estimated=%d actual=%d (ratio=%.2f) "\
-                    "[uncached=%d cache_write=%d cache_read=%d output=%d]",
-                    chat_model, window_tokens, completion.true_input, ratio,
-                    completion.input_tokens, completion.cache_write, completion.cache_read, completion.output_tokens,
-                )
+            except TRANSIENT_ERRORS as exc:
+                if mcp_servers is None:
+                    await self._handle_completion_error(incoming, reply, exc, cred)
+                    return
+                # MCP server unreachable after all retries — fall back to a
+                # completion without tools, but tell Claude what happened so he
+                # can acknowledge it rather than silently losing persistence.
+                logger.warning("MCP unavailable after retries; falling back to non-MCP completion: %s", exc)
+                await reply(f"{self.config.system_prefix} Memory tools temporarily unavailable — continuing without them.")
+                try:
+                    completion = await complete(
+                        client=client,
+                        model=chat_model,
+                        system=system,
+                        messages=messages,
+                        max_tokens=self.config.reply_budget,
+                        mcp_servers=None,
+                    )
+                except Exception as fallback_exc:
+                    await self._handle_completion_error(incoming, reply, fallback_exc, cred)
+                    return
             except Exception as exc:
                 await self._handle_completion_error(incoming, reply, exc, cred)
                 return
+
+            # window_tokens is len // 4 + 5 + (overhead) per message. Empirically the ratio
+            # here is about 1.05, but it's different for opus 4.7 and likely later
+            # models, so good to keep it around
+            ratio = completion.true_input / window_tokens if window_tokens else float("nan")
+            logger.info(
+                "Token usage for %s: estimated=%d actual=%d (ratio=%.2f) "\
+                "[uncached=%d cache_write=%d cache_read=%d output=%d]",
+                chat_model, window_tokens, completion.true_input, ratio,
+                completion.input_tokens, completion.cache_write, completion.cache_read, completion.output_tokens,
+            )
 
         # Only a POOL (bot-key) success clears the chat's failure streak.
         # Clearing it on a user-key success would let one BYO user mask an
@@ -1204,6 +1279,64 @@ class Bot:
         lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
         await self._say(ctx, "\n".join(lines), markdown=False)
 
+    @command(admin="always")
+    async def command_showprompt(self, ctx: CommandCtx):
+        window = self.store.window(ctx.chat_id)
+        base = self._base_prompt(
+            ctx.chat_id, window.snapshot(), ctx.is_private,
+            ctx.user.id if ctx.is_private else None,
+        )
+        rendered = self._render_changelog()
+        if rendered:
+            changelog_section = f"\n\n— Changelog —\n{rendered}"
+        else:
+            changelog_section = "\n\n— Changelog —\n(no entries yet)"
+        await self._say(ctx, base + changelog_section, markdown=False)
+
+    @command(admin="always")
+    async def command_appendprompt(self, ctx: CommandCtx):
+        if not ctx.args:
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
+            return
+
+        words = list(ctx.args)
+        timestamp, text_start = self._parse_date_prefix(words)
+        text = " ".join(words[text_start:])
+
+        if not text:
+            await self._say(ctx, "Usage: /appendprompt [YYYY-MM-DD [HH:MM]] <text>", markdown=False)
+            return
+
+        entry = {"timestamp": timestamp, "text": text}
+        self._prompt_changelog.append(entry)
+        self._save_prompt_changelog()
+        await self._say(ctx, f"Appended. Changelog is now:\n\n{self._render_changelog()}", markdown=False)
+
+    def _parse_date_prefix(self, words: list[str]) -> tuple[str, int]:
+        """Try to parse an optional YYYY-MM-DD [HH:MM] prefix from words.
+
+        Returns (timestamp_str, index_of_first_text_word). If no date is
+        found, timestamp is the current time and index is 0.
+        """
+        for fmt, n in [("%Y-%m-%d %H:%M", 2), ("%Y-%m-%d", 1)]:
+            if len(words) >= n:
+                try:
+                    dt = datetime.strptime(" ".join(words[:n]), fmt)
+                    return dt.strftime("%Y-%m-%d %H:%M +00"), n
+                except ValueError:
+                    pass
+        return datetime.now(UTC).strftime("%Y-%m-%d %H:%M +00"), 0
+
+    @command(admin="always")
+    async def command_undoprompt(self, ctx: CommandCtx):
+        if not self._prompt_changelog:
+            await self._say(ctx, "Changelog is already empty.", markdown=False)
+            return
+        removed = self._prompt_changelog.pop()
+        self._save_prompt_changelog()
+        await self._say(ctx, f"Removed: [{removed['timestamp']}] {removed['text']}", markdown=False)
+
+
     @command(admin="in_groups")
     async def command_billing(self, ctx: CommandCtx):
         # DM short-circuit stays in-body: it REPLIES (not a silent drop), and
@@ -1275,6 +1408,9 @@ class Bot:
         self.application.add_handler(CommandHandler("keystatus", self.command_keystatus), group=0)
         self.application.add_handler(CommandHandler("allow", self.command_allow), group=0)
         self.application.add_handler(CommandHandler("disallow", self.command_disallow), group=0)
+        self.application.add_handler(CommandHandler("showprompt", self.command_showprompt), group=0)
+        self.application.add_handler(CommandHandler("appendprompt", self.command_appendprompt), group=0)
+        self.application.add_handler(CommandHandler("undoprompt", self.command_undoprompt), group=0)
         self.application.add_handler(CommandHandler("poollist", self.command_poollist), group=0)
         self.application.add_handler(CommandHandler("billing", self.command_billing), group=0)
 
