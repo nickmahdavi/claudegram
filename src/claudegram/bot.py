@@ -57,6 +57,11 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 # Discard pings older than this many seconds
 STALE_PING_AGE_S = 60
 TELEGRAM_CHAR_LIMIT = 4096
+# Per-chat debounce window. Each ping bumps the chat's deadline this far into
+# the future; the runner fires one completion after the window goes quiet.
+# Telegram splits long sends into multiple messages within a few hundred ms;
+# 1s easily catches the split without feeling laggy.
+DEBOUNCE_S = 1.0
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -290,6 +295,18 @@ class Bot:
         # once instead of on every message.
         self._view_last_write: dict[int, float] = {}
         self._view_warned: set[int] = set()
+
+        # Per-chat ping coalescing. on_ping bumps `_ping_deadline` and stashes
+        # the latest Incoming in `_ping_pending`; a single `_ping_runner` task
+        # per chat waits out the debounce window then fires one completion
+        # against the most recent ping. Without this, Telegram's habit of
+        # splitting long replies into several updates -- or just a user
+        # firing off three messages in a row -- triggered a separate (racing)
+        # completion for each one.
+        self._ping_tasks: dict[int, asyncio.Task] = {}
+        self._ping_deadline: dict[int, float] = {}
+        self._ping_pending: dict[int, Incoming] = {}
+        self._ping_coalesced: dict[int, int] = {}
 
     async def _post_init(self, _: Application):
         try:
@@ -608,9 +625,83 @@ class Bot:
 
     @incoming
     async def on_ping(self, incoming: Incoming) -> Optional[Outgoing]:
-        # Reply by chat_id rather than against a Message object: the @incoming
-        # decorator hands us a transport-agnostic Incoming, and send_message
-        # threaded with reply_to keeps the same threading reply_text gave us.
+        """Coalesce a burst of pings into one completion. Stale pings are
+        dropped here -- we don't want a 24h-stale telegram update bumping the
+        debounce deadline -- otherwise: extend the deadline, stash the latest
+        Incoming (the eventual reply targets it), and make sure a per-chat
+        runner task is alive to fire when the window goes quiet."""
+        # telegram buffers updates for 24h and for now I think the best design is to avoid spamming
+        # users after the bot comes back up following an outage. but in the future we should buffer
+        # these messages locally and allow the user to decide whether to process them or not,
+        # probably in bulk with a single command. and this should also be unified with missed
+        # buffered messages while out of credits, during anthropic API outages, etc. for now, since
+        # we aren't handling or resending these, it's consistent to just drop stale messages
+        now = datetime.now(UTC)
+        last_load = self.store.get_last_load_at(incoming.chat_id)
+        cutoff = max(filter(None, [self.start_time, now - timedelta(seconds=STALE_PING_AGE_S), last_load]))
+        if incoming.date < cutoff:
+            age = (now - incoming.date).total_seconds()
+            logger.info(
+                "Skipping stale ping in chat %s (age=%.1fs, cutoff=%s)",
+                incoming.chat_id, age, cutoff.isoformat(),
+            )
+            return None
+
+        chat_id = incoming.chat_id
+        # No lock: there's no await between these reads/writes, so asyncio
+        # guarantees the runner can't see a partial update.
+        self._ping_deadline[chat_id] = time.monotonic() + DEBOUNCE_S
+        self._ping_pending[chat_id] = incoming
+        self._ping_coalesced[chat_id] = self._ping_coalesced.get(chat_id, 0) + 1
+        task = self._ping_tasks.get(chat_id)
+        if task is None or task.done():
+            self._ping_tasks[chat_id] = asyncio.create_task(self._ping_runner(chat_id))
+            logger.info("Ping queued for chat %s (debounce %.1fs)", chat_id, DEBOUNCE_S)
+        else:
+            logger.debug("Ping extended debounce for chat %s", chat_id)
+        return None
+
+    async def _ping_runner(self, chat_id: int) -> None:
+        """Per-chat debounce coroutine. Waits for the deadline to settle, fires
+        one completion against the latest pending Incoming, then loops to catch
+        any pings that arrived during the completion. Exits when there's
+        nothing pending so a fresh ping must spawn a fresh runner."""
+        try:
+            while True:
+                # Inner loop: a new ping during sleep may push the deadline
+                # forward, so reread it after every nap.
+                while True:
+                    deadline = self._ping_deadline.get(chat_id)
+                    if deadline is None:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    await asyncio.sleep(remaining)
+                incoming = self._ping_pending.pop(chat_id, None)
+                self._ping_deadline.pop(chat_id, None)
+                coalesced = self._ping_coalesced.pop(chat_id, 0)
+                if incoming is None:
+                    break
+                if coalesced > 1:
+                    logger.info(
+                        "Coalesced %d pings into 1 completion for chat %s",
+                        coalesced, chat_id,
+                    )
+                try:
+                    await self._run_completion(incoming)
+                except Exception:
+                    logger.exception("Debounced completion failed for chat %s", chat_id)
+        finally:
+            # Only clear the slot if it still points at us -- never pop a
+            # successor that on_ping may have already installed.
+            if self._ping_tasks.get(chat_id) is asyncio.current_task():
+                self._ping_tasks.pop(chat_id, None)
+
+    async def _run_completion(self, incoming: Incoming) -> None:
+        """Fire one completion for the most recent ping in a debounce window.
+        Sends its own system replies for credential refusals -- on_ping no
+        longer awaits us, so the @incoming Outgoing plumbing is gone."""
         bot = self.application.bot
 
         async def reply(text: str) -> Optional[telegram.Message]:
@@ -623,25 +714,7 @@ class Bot:
         prompt_mode = PromptMode.CHAT_PRIVATE if incoming.is_private else PromptMode.CHAT
         render_mode = RenderMode.CHAT  # TODO Prefill is borked atm, will destub later
 
-        logger.info("on_ping triggered in chat %s", incoming.chat_id)
-
-        # telegram buffers updates for 24h and for now I think the best design is to avoid spamming
-        # users after the bot comes back up following an outage. but in the future we should buffer
-        # these messages locally and allow the user to decide whether to process them or not,
-        # probably in bulk with a single command. and this should also be unified with missed
-        # buffered messages while out of credits, during anthropic API outages, etc. for now, since
-        # we aren't handling or resending these, it's consistent to just drop stale messages
-        
-        now = datetime.now(UTC)
-        last_load = self.store.get_last_load_at(incoming.chat_id)
-        cutoff = max(filter(None, [self.start_time, now - timedelta(seconds=STALE_PING_AGE_S), last_load]))
-        if incoming.date < cutoff:
-            age = (now - incoming.date).total_seconds()
-            logger.info(
-                "Skipping stale ping in chat %s (age=%.1fs, cutoff=%s)",
-                incoming.chat_id, age, cutoff.isoformat(),
-            )
-            return
+        logger.info("Firing completion for chat %s", incoming.chat_id)
 
         # Resolve whose credential pays for this ping. None => polite refusal,
         # and crucially we must NOT touch the failure-streak/admin-alert
@@ -650,20 +723,16 @@ class Bot:
         cred = self.credentials.resolve_credential(incoming.sender.user_id, incoming.chat_id, incoming.is_private)
         if cred is None:
             logger.info("No credential for user %s in chat %s; refusing", incoming.sender.user_id, incoming.chat_id)
-            return Outgoing(
-                text=no_credential_reply(incoming.is_private),
-                system=True
-            )
+            await reply(f"{self.config.system_prefix} {no_credential_reply(incoming.is_private)}")
+            return
         try:
             client = self.credentials.client_for(cred)
         except Exception:
             logger.exception(
                 "Failed to build client for cred kind=%s user=%s", cred.kind.value, incoming.sender.user_id,
             )
-            return Outgoing(
-                text=credential_broken_reply(),
-                system=True
-            )
+            await reply(f"{self.config.system_prefix} {credential_broken_reply()}")
+            return
 
         prompt_template = Template(SYSTEM_PROMPTS.get(prompt_mode, ""))
         chat_model = self.store.get_model_pref(incoming.chat_id) or self.config.default_claude_model
@@ -696,6 +765,12 @@ class Bot:
         ))
 
         messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
+        if not messages:
+            logger.info(
+                "Nothing to reply to in chat %s (window has no user turn after trim); skipping",
+                incoming.chat_id,
+            )
+            return
 
         mcp_servers = None
         if self.mcp_tokens is not None:
@@ -769,7 +844,6 @@ class Bot:
             return
 
         await self._send(reply, incoming, completion.text, incarnation, display_tz)
-        return None
 
 
     async def _handle_completion_error(

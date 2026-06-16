@@ -122,6 +122,16 @@ def render_history(
         hist = list(messages)
         while hist and hist[0].user_id == bot_info.user_id:
             hist.pop(0)
+        # CHAT mode (no prefill) requires the message list to end with a user
+        # turn -- the API rejects an assistant tail with "must end with user
+        # message". The debounce runner can fire a follow-up completion in a
+        # window where a new user ping arrived during the previous completion's
+        # API call, ordering it before the bot's reply in the persisted window
+        # (on_message wins the chat lock against the in-flight _send). Trim
+        # whatever assistant turns happen to sit at the tail so the request is
+        # always well-formed.
+        while hist and hist[-1].user_id == bot_info.user_id:
+            hist.pop()
 
         rendered: list[tuple[Literal["user", "assistant"], str]] = []
         last_emitted_date = None
