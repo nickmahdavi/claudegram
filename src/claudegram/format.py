@@ -31,7 +31,17 @@ _TAG_RE = re.compile(
 
 
 def _escape_html(s: str) -> str:
+    """Escape for HTML *content* (text between tags). Telegram's HTML parser
+    accepts exactly four named entities: &lt; &gt; &amp; &quot;. We only emit
+    the first three here -- " is safe inside text content."""
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _escape_attr(s: str) -> str:
+    """Escape for HTML *attribute values* (href="..."). The bare " char would
+    end the attribute mid-value and break the whole tag, so we additionally
+    swap it for &quot;."""
+    return _escape_html(s).replace('"', "&quot;")
 
 
 def _extract_url(text: str, start: int) -> int:
@@ -94,14 +104,24 @@ def md_to_html(text: str) -> str:
     def link_slot(n: int) -> str:    return f"{sentinel}LINK_{n}\x00"
 
     # 1. Stash fenced code first; bodies skip everything else. The language
-    # tag on the opening fence (` ```python `) is dropped -- Telegram <pre>
-    # doesn't render it anyway.
+    # hint on the opening fence (` ```python `) survives as a `language-X`
+    # class on a nested `<code>` -- Telegram clients that support syntax
+    # highlighting (mobile, mainly) use this; clients that don't ignore it.
     fences: list[str] = []
     def _stash_pre(m: re.Match) -> str:
-        body = m.group(1).rstrip("\n")
-        fences.append(f"<pre>{_escape_html(body)}</pre>")
+        # Sanitize to a sane class-name shape so a weird fence header can't
+        # inject odd attribute content. The full URL-attr escape already
+        # blocks tag-breaking chars, but this keeps the class identifier
+        # itself well-formed.
+        lang = re.sub(r"[^a-zA-Z0-9+_.\-]", "", m.group(1).strip())
+        body = _escape_html(m.group(2).rstrip("\n"))
+        if lang:
+            html = f'<pre><code class="language-{lang}">{body}</code></pre>'
+        else:
+            html = f"<pre>{body}</pre>"
+        fences.append(html)
         return code_slot(len(fences) - 1)
-    text = re.sub(r"```[^\n]*\n?(.*?)```", _stash_pre, text, flags=re.DOTALL)
+    text = re.sub(r"```([^\n]*)\n?(.*?)```", _stash_pre, text, flags=re.DOTALL)
 
     # 2. Stash inline code.
     inlines: list[str] = []
@@ -138,7 +158,7 @@ def md_to_html(text: str) -> str:
                 out.append(s[i])
                 i += 1
                 continue
-            links.append(f'<a href="{_escape_html(url)}">{_escape_html(disp)}</a>')
+            links.append(f'<a href="{_escape_attr(url)}">{_escape_html(disp)}</a>')
             out.append(link_slot(len(links) - 1))
             i = url_end + 1
         return "".join(out)
@@ -158,8 +178,9 @@ def md_to_html(text: str) -> str:
     text = re.sub(r"(?<![*\w])\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"(?<![_\w])_([^_\s\n](?:[^_\n]*?[^_\s\n])?)_(?!\w)", r"<i>\1</i>", text)
 
-    # 6. Strikethrough.
-    text = re.sub(r"~~(\S(?:[^~\n]*?\S)?)~~", r"<s>\1</s>", text)
+    # 6. Strikethrough. Same content-boundary class as emphasis so `~ a ~`
+    # doesn't match and `~~~x~~~` doesn't grab a `~` as boundary.
+    text = re.sub(r"~~([^~\s\n](?:[^~\n]*?[^~\s\n])?)~~", r"<s>\1</s>", text)
 
     # 7. Headers AFTER emphasis. Strip any inner `<b>` tags from the body
     # before wrapping, otherwise `## **Foo**` becomes `<b><b>Foo</b></b>` which
