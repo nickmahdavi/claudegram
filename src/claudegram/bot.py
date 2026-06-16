@@ -45,7 +45,7 @@ from .error import (
 )
 from .identity import UserInfo
 from .importer import parse_export
-from .message import UTC, Forward, Message, Reply
+from .message import UTC, Forward, Image, Message, Reply
 from .mcp import McpTokenManager
 from .model import MODEL_ALIASES, TRANSIENT_ERRORS, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
@@ -57,6 +57,10 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 # Discard pings older than this many seconds
 STALE_PING_AGE_S = 60
 TELEGRAM_CHAR_LIMIT = 4096
+# Anthropic's vision API caps image source bytes at 5 MB. Telegram-compressed
+# photos are usually well under this, but cap defensively so a giant attachment
+# can't trip a downstream rejection.
+PHOTO_MAX_BYTES = 5 * 1024 * 1024
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -168,8 +172,9 @@ def incoming(func: Callable[["Bot", Incoming], Awaitable[Optional[Outgoing]]]) -
         if not message or not message.from_user:
             return
 
-        text = message.text or message.caption
-        if not text:
+        text = message.text or message.caption or ""
+        has_media = bool(message.photo)
+        if not text and not has_media:
             return
 
         # Belt-and-suspenders: on_ping's registration already gates on the
@@ -463,14 +468,30 @@ class Bot:
         is warned about once per chat rather than on every write."""
         try:
             system = self._view_system_prompt(chat_id, snapshot, is_private, partner_id)
-            messages = render_history(snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz)
+            # embed_images=False so image blocks come back as `[image: ...]`
+            # text placeholders -- we don't want to read + base64-encode photo
+            # bytes just to dump them into a human-readable log.
+            messages = render_history(
+                snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz,
+                resolve_media=None, embed_images=False,
+            )
             blocks = [f"System: {system}"]
             for mp in messages:
                 # MessageParam is a TypedDict (plain dict at runtime), not an attr object.
                 prefix = "H:" if mp["role"] == "user" else "A:"
                 content = mp["content"]
-                content = content if isinstance(content, str) else str(content)
-                blocks.append(f"{prefix} {content}")
+                if isinstance(content, str):
+                    body = content
+                else:
+                    parts = []
+                    for block in content:
+                        btype = block.get("type", "?")
+                        if btype == "text":
+                            parts.append(block.get("text", ""))
+                        else:
+                            parts.append(f"[{btype} block]")
+                    body = "".join(parts)
+                blocks.append(f"{prefix} {body}")
             text = "\n\n".join(blocks) + "\n"
             await asyncio.to_thread(self._write_view_file, self.store.view_path(chat_id), text)
             self._view_warned.discard(chat_id)
@@ -489,6 +510,34 @@ class Bot:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
         os.replace(tmp, path)
+
+    async def _download_photo(self, message: telegram.Message) -> Optional[Image]:
+        """Pull the highest-resolution PhotoSize down to the chat's media dir
+        and return an Image ref (relative path + media_type). Telegram delivers
+        compressed JPEGs; we don't bother sniffing. On any failure, return None
+        so the message still gets stored as text-only — losing the picture is
+        recoverable, dropping the message wouldn't be."""
+        chat_id = message.chat_id
+        msg_id = message.message_id
+        photo = message.photo[-1]
+        if photo.file_size and photo.file_size > PHOTO_MAX_BYTES:
+            logger.warning(
+                "Photo in chat %s msg %s is %d bytes (> %d cap); skipping image attachment",
+                chat_id, msg_id, photo.file_size, PHOTO_MAX_BYTES,
+            )
+            return None
+        target = self.store.media_path(chat_id, msg_id, "jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            tg_file = await photo.get_file()
+            await tg_file.download_to_drive(target)
+        except Exception:
+            logger.exception("Failed to download photo for chat %s msg %s", chat_id, msg_id)
+            return None
+        rel = target.relative_to(self.store.data_dir).as_posix()
+        logger.info("Saved photo for chat %s msg %s to %s (%d bytes)",
+                    chat_id, msg_id, rel, photo.file_size or 0)
+        return Image(path=rel, media_type="image/jpeg")
 
     async def _drop_pasted_secret(self, message: telegram.Message) -> None:
         """Delete a message that contains an API key, refuse, and warn. Shared by
@@ -523,8 +572,9 @@ class Bot:
         if not message or not message.from_user:
             return
 
-        text = message.text or message.caption
-        if not text:
+        text = message.text or message.caption or ""
+        has_photo = bool(message.photo)
+        if not text and not has_photo:
             return
 
         # Secret guard — FIRST, in EVERY chat type, and BEFORE the is_active /
@@ -535,14 +585,14 @@ class Bot:
         # chats are just as exposed as DMs. Delete it, refuse, and raise
         # ApplicationHandlerStop so on_ping (a later handler group) never sees it
         # (a bare `return` only ends THIS handler).
-        if _looks_like_secret(text):
+        if text and _looks_like_secret(text):
             await self._drop_pasted_secret(message)
             raise ApplicationHandlerStop
 
         if not self.store.is_active(message.chat_id):
             return
 
-        if self.config.ignore_prefix and text.startswith(self.config.ignore_prefix):
+        if text and self.config.ignore_prefix and text.startswith(self.config.ignore_prefix):
             logger.debug("Skipping ignored message (prefix=%r) in chat %s", self.config.ignore_prefix, message.chat_id)
             return
 
@@ -567,6 +617,8 @@ class Bot:
                            message.chat_id, exc_info=True)
             forward = None
 
+        image = await self._download_photo(message) if has_photo else None
+
         msg = Message(
             id=message.message_id,
             ts=message.date,
@@ -575,6 +627,7 @@ class Bot:
             reply_to=replied.message_id if replied else None,
             reply=reply,
             forward=forward,
+            image=image,
         )
 
         async with self.store.lock(message.chat_id):
@@ -695,7 +748,10 @@ class Bot:
             tz_directory=tz_directory
         ))
 
-        messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
+        messages = render_history(
+            snapshot, self.me, render_mode, self.store.resolve_user, display_tz,
+            resolve_media=self.store.resolve_media, embed_images=True,
+        )
 
         mcp_servers = None
         if self.mcp_tokens is not None:
@@ -1432,9 +1488,12 @@ class Bot:
         # caption equivalent (filters.COMMAND ignores caption_entities), so a
         # `/load`-captioned upload — already handled by command_load in group 0 —
         # doesn't also fall through here and get stored as the literal "/load".
+        # filters.PHOTO covers bare-photo messages (no caption) so they reach
+        # on_message; a photo with caption is already matched via CAPTION, and a
+        # photo with /command caption is still excluded by CaptionCommand.
         # Shared by on_message (group 1) and on_ping (group 2): neither should
         # see a caption-command.
-        text_or_caption = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & ~CaptionCommand()
+        text_or_caption = (filters.TEXT | filters.CAPTION | filters.PHOTO) & ~filters.COMMAND & ~CaptionCommand()
         self.application.add_handler(MessageHandler(text_or_caption, self.on_message), group=1)
 
         # on_ping gating is fully declarative: the chat must be active, the

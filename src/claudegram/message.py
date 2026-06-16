@@ -39,6 +39,25 @@ class Reply:
         )
 
 @dataclass(slots=True)
+class Image:
+    """Reference to a persisted image attached to a Message.
+
+    `path` is stored relative to the data dir so the data dir stays portable;
+    callers join it back to an absolute path via Store.resolve_media. Bytes live
+    on disk (not in the JSONL) — see Store.media_path for the layout. The
+    renderer reads + base64-encodes on demand at API-call time."""
+    path: str
+    media_type: str
+
+    def to_dict(self) -> dict:
+        return {"path": self.path, "media_type": self.media_type}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Self:
+        return cls(path=d["path"], media_type=d["media_type"])
+
+
+@dataclass(slots=True)
 class Forward:
     """Provenance for a forwarded message.
 
@@ -85,6 +104,7 @@ class Message:
     reply_to: Optional[int] = None
     reply: Optional[Reply] = None
     forward: Optional[Forward] = None
+    image: Optional[Image] = None
     _tokens: int | None = field(init=False, repr=False, default=None)
 
     TAG_OVERHEAD: ClassVar[int] = 12
@@ -94,6 +114,11 @@ class Message:
     # Like the others it's a heuristic -- actual usage is corrected by the
     # estimated-vs-true ratio logged after each completion.
     FORWARD_OVERHEAD: ClassVar[int] = 12
+    # Flat estimate per attached image. Anthropic's vision tokenization caps
+    # around ~1600 tokens for a max-resolution image; most Telegram-compressed
+    # photos land well under that. Like the others, the per-completion ratio
+    # log will surface drift if this is wildly off.
+    IMAGE_OVERHEAD: ClassVar[int] = 1200
 
     @property
     def tokens(self) -> int:
@@ -103,6 +128,8 @@ class Message:
                 n += self.REPLY_OVERHEAD
             if self.forward is not None:
                 n += self.FORWARD_OVERHEAD
+            if self.image is not None:
+                n += self.IMAGE_OVERHEAD
             self._tokens = n
         return self._tokens
 
@@ -115,6 +142,7 @@ class Message:
             "reply_to": self.reply_to,
             "reply": self.reply.to_dict() if self.reply else None,
             "forward": self.forward.to_dict() if self.forward else None,
+            "image": self.image.to_dict() if self.image else None,
         }
 
     @classmethod
@@ -133,6 +161,13 @@ class Message:
                 forward = Forward.from_dict(raw_fwd)
             except Exception as e:
                 logger.warning("Failed to parse forward in message %s: %s", d.get("id", "with missing id"), e)
+        image = None
+        raw_img = d.get("image")
+        if raw_img is not None:
+            try:
+                image = Image.from_dict(raw_img)
+            except Exception as e:
+                logger.warning("Failed to parse image in message %s: %s", d.get("id", "with missing id"), e)
         return cls(
             id=int(d["id"]),
             ts=datetime.fromisoformat(d["ts"]),
@@ -141,6 +176,7 @@ class Message:
             reply_to=d.get("reply_to"),
             reply=reply,
             forward=forward,
+            image=image,
         )
 
 

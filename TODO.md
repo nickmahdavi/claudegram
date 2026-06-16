@@ -42,7 +42,7 @@
 - [ ] web search + web fetch
 - [ ] code execution + sandbox
 - [ ] memory
-- [ ] media part 1 (photos to claude)-- base64 encode, image content blocks in `Window.history`, persist image bytes
+- [x] media part 1 (photos to claude)-- base64 encode, image content blocks in `Window.history`, persist image bytes
 - [ ] media part 2: voice / video / document placeholders, voice transcription, render text files
 
 ### ux
