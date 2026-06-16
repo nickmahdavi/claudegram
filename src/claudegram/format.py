@@ -6,13 +6,21 @@ literally in the chat. We go via HTML rather than Telegram's MarkdownV2 because
 the escape rules are saner (only `<`, `>`, `&` need escaping in plain text) and
 nesting is more forgiving.
 
+Telegram-flavoured extensions on top of CommonMark:
+- `__text__` -> underline (`<u>`) rather than bold. CommonMark treats it as
+  bold-equivalent to `**`, but `**` is the more common bold form and reusing
+  `__` for underline matches Telegram MarkdownV2 conventions and gives us a
+  usable underline syntax.
+- `||text||` -> spoiler (`<tg-spoiler>`).
+- `> line` (one or more consecutive) -> `<blockquote>`.
+
 Limitations / known asymmetries with CommonMark:
-- `<pre>` has no syntax highlighting (Telegram doesn't support it).
-- Headers promote to `<b>`. List markers become Unicode bullets (Telegram has
-  no native list shape).
+- Numbered/ordered lists fall through as plain text (Telegram has no native
+  ordered list).
 - Horizontal rules and tables fall through as plain text.
-- Dunder-style identifiers like `__init__` get treated as bold per CommonMark
-  spec; if that hurts in practice we can flip `__` bold off and require `**`.
+- Headers promote to `<b>` (Telegram has no header element).
+- Dunder-style identifiers like `__init__` get wrapped in `<u>` because the
+  `__` rule matches them; if that hurts in practice we can flip `__` off.
 - Deeply interleaved span markers (e.g. ``~~**x~~**``) can produce mis-nested
   HTML that Telegram rejects -- the converter validates the tag stack at the
   end and falls back to the original markdown text if it's malformed, so the
@@ -167,28 +175,44 @@ def md_to_html(text: str) -> str:
     # 4. Escape what survives stashing.
     text = _escape_html(text)
 
-    # 5. Bold (** or __), then italic (* or _). Content boundary class
-    # forbids whitespace AND the marker char itself, so a spurious `* a *`
-    # (with internal whitespace) doesn't match, bullets at line start (`* item`)
-    # don't match, and the outer pair of `** ab **` can't grab `* ab *` as its
-    # italic content. Doubled markers run before single so the `*` pairs aren't
-    # consumed by the italic pass.
+    # 5. Bold (`**`), underline (`__`), italic (`*` or `_`), strike (`~~`),
+    # spoiler (`||`). Content boundary class forbids whitespace AND the
+    # marker char itself, so `* a *` (internal whitespace) doesn't match,
+    # bullets at line start (`* item`) don't match, and `** ab **` can't
+    # grab `* ab *` as its italic content. Doubled markers run before single
+    # so the `*` pairs aren't consumed by the italic pass.
     text = re.sub(r"\*\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<![_\w])__([^_\s\n](?:[^_\n]*?[^_\s\n])?)__(?!\w)", r"<b>\1</b>", text)
+    text = re.sub(r"(?<![_\w])__([^_\s\n](?:[^_\n]*?[^_\s\n])?)__(?!\w)", r"<u>\1</u>", text)
     text = re.sub(r"(?<![*\w])\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"(?<![_\w])_([^_\s\n](?:[^_\n]*?[^_\s\n])?)_(?!\w)", r"<i>\1</i>", text)
-
-    # 6. Strikethrough. Same content-boundary class as emphasis so `~ a ~`
-    # doesn't match and `~~~x~~~` doesn't grab a `~` as boundary.
     text = re.sub(r"~~([^~\s\n](?:[^~\n]*?[^~\s\n])?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"\|\|([^|\s\n](?:[^|\n]*?[^|\s\n])?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
 
-    # 7. Headers AFTER emphasis. Strip any inner `<b>` tags from the body
+    # 6. Headers AFTER emphasis. Strip any inner `<b>` tags from the body
     # before wrapping, otherwise `## **Foo**` becomes `<b><b>Foo</b></b>` which
     # Telegram rejects. The header is already bold; the inner ones are dupes.
     def _wrap_header(m: re.Match) -> str:
         body = m.group(1).strip().replace("<b>", "").replace("</b>", "")
         return f"<b>{body}</b>"
     text = re.sub(r"^#{1,6}\s+(.+)$", _wrap_header, text, flags=re.MULTILINE)
+
+    # 7. Blockquotes. One `<blockquote>` per run of consecutive `>`-prefixed
+    # lines, with the prefix stripped from each line. Matches `&gt;` because
+    # the escape pass above already turned `>` into the entity; emphasis,
+    # code, and links inside the quote line have also already been processed
+    # by the time we get here, so we just wrap.
+    def _wrap_quote(m: re.Match) -> str:
+        lines = m.group(0).rstrip("\n").split("\n")
+        inner_lines: list[str] = []
+        for line in lines:
+            if line.startswith("&gt; "):
+                inner_lines.append(line[5:])
+            elif line.startswith("&gt;"):
+                inner_lines.append(line[4:])
+            else:
+                inner_lines.append(line)
+        return f"<blockquote>{chr(10).join(inner_lines)}</blockquote>\n"
+    text = re.sub(r"(?:^&gt;[^\n]*(?:\n|$))+", _wrap_quote, text, flags=re.MULTILINE)
 
     # 8. Bullet markers -> Unicode bullet, preserving indent.
     text = re.sub(r"^([ \t]*)[*-][ \t]+", r"\1• ", text, flags=re.MULTILINE)
