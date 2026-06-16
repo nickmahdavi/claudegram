@@ -321,6 +321,17 @@ class Bot:
                     len(self.config.admin_user_ids), self.start_time.isoformat())
 
     async def _post_shutdown(self, _: Application):
+        # Cancel + await any in-flight debounce runners FIRST. Otherwise a
+        # runner mid-completion would hit a closed httpx client on the next
+        # await, and a runner mid-sleep would leak its pending Incoming via
+        # the abandoned per-chat dicts (the finally drain handles cleanup
+        # once the cancellation lands).
+        tasks = [t for t in list(self._ping_tasks.values()) if t and not t.done()]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
         # Close every per-user httpx pool (and the shared pool client) exactly
         # once, at shutdown — never mid-run, where an evicted client might still
         # be serving an in-flight completion on another coroutine.
@@ -661,6 +672,23 @@ class Bot:
             logger.debug("Ping extended debounce for chat %s", chat_id)
         return None
 
+    def _drop_debounce(self, chat_id: int) -> None:
+        """Cancel any pending debounce for this chat and drop its state.
+
+        Called from /reset and /load -- the chat's history just got wiped or
+        replaced, and any debounce-queued ping refers to the OLD incarnation.
+        Firing it against the new window would render a reply against the
+        wrong context. We cancel the runner; its finally drains the dicts.
+        We also pre-emptively pop pending/deadline/coalesced so that if the
+        runner was about to fire BEFORE the cancellation lands at its next
+        await, it sees an empty pending and bails."""
+        self._ping_pending.pop(chat_id, None)
+        self._ping_deadline.pop(chat_id, None)
+        self._ping_coalesced.pop(chat_id, None)
+        task = self._ping_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
     async def _ping_runner(self, chat_id: int) -> None:
         """Per-chat debounce coroutine. Waits for the deadline to settle, fires
         one completion against the latest pending Incoming, then loops to catch
@@ -683,6 +711,25 @@ class Bot:
                 coalesced = self._ping_coalesced.pop(chat_id, 0)
                 if incoming is None:
                     break
+                # on_ping's stale-check fires at QUEUE time. By the time the
+                # debounce window expires + the previous completion finishes,
+                # /load may have advanced last_load_at past this ping's date,
+                # or the user's stale-cutoff (STALE_PING_AGE_S) may have crept
+                # past it. Re-check so we don't reply to something the chat
+                # state has explicitly moved past.
+                now = datetime.now(UTC)
+                last_load = self.store.get_last_load_at(chat_id)
+                cutoff = max(filter(None, [
+                    self.start_time,
+                    now - timedelta(seconds=STALE_PING_AGE_S),
+                    last_load,
+                ]))
+                if incoming.date < cutoff:
+                    logger.info(
+                        "Dropping post-debounce stale ping in chat %s (age=%.1fs)",
+                        chat_id, (now - incoming.date).total_seconds(),
+                    )
+                    continue
                 if coalesced > 1:
                     logger.info(
                         "Coalesced %d pings into 1 completion for chat %s",
@@ -693,15 +740,31 @@ class Bot:
                 except Exception:
                     logger.exception("Debounced completion failed for chat %s", chat_id)
         finally:
-            # Only clear the slot if it still points at us -- never pop a
-            # successor that on_ping may have already installed.
+            # Only clear if the slot still points at us -- never pop a
+            # successor that on_ping may have already installed. When we DO
+            # own the slot, drain the per-chat dicts: a CancelledError during
+            # sleep (PTB shutdown, /reset cancelling us, etc.) would
+            # otherwise leave a phantom Incoming behind for the next runner
+            # to pick up against the wrong incarnation.
             if self._ping_tasks.get(chat_id) is asyncio.current_task():
                 self._ping_tasks.pop(chat_id, None)
+                self._ping_pending.pop(chat_id, None)
+                self._ping_deadline.pop(chat_id, None)
+                self._ping_coalesced.pop(chat_id, None)
 
     async def _run_completion(self, incoming: Incoming) -> None:
         """Fire one completion for the most recent ping in a debounce window.
         Sends its own system replies for credential refusals -- on_ping no
         longer awaits us, so the @incoming Outgoing plumbing is gone."""
+        # /stop during the debounce window means the user explicitly asked us
+        # to go silent between queueing and firing. Respect it -- no reply.
+        if not self.store.is_active(incoming.chat_id):
+            logger.info(
+                "Chat %s went inactive during debounce window; skipping completion",
+                incoming.chat_id,
+            )
+            return
+
         bot = self.application.bot
 
         async def reply(text: str) -> Optional[telegram.Message]:
@@ -975,6 +1038,10 @@ class Bot:
     async def command_reset(self, ctx: CommandCtx):
         async with self.store.lock(ctx.chat_id):
             window, file, context = self.store.reset(ctx.chat_id)
+        # Drop any in-flight debounce for this chat; its pending Incoming
+        # belongs to the pre-reset incarnation and the reply would be
+        # nonsensical against a freshly-wiped window.
+        self._drop_debounce(ctx.chat_id)
 
         if window or file or context:
             logger.info("Reset chat %s (window=%s, file=%s, ctx=%s)", ctx.chat_id, window, file, context)
@@ -1075,6 +1142,10 @@ class Bot:
 
                 backup = self.store.replace_chat(chat_id, result.messages)
                 self.store.mark_loaded(chat_id)
+                # Same rationale as /reset: any pending Incoming was queued
+                # against the OLD window; firing it now would reply against
+                # the imported history with stale context.
+                self._drop_debounce(chat_id)
             except Exception as e:
                 logger.exception("Load failed for chat %s", chat_id)
                 await self._say(ctx, f"Load failed: {e}", markdown=False)
