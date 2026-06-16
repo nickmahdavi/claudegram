@@ -141,6 +141,7 @@ async def complete(
     messages: list[MessageParam],
     max_tokens: int,
     mcp_servers: Optional[list[dict]] = None,
+    tools: Optional[list[dict]] = None,
 ) -> ClaudeResponse:
     # Two explicit cache breakpoints, used together:
     #   1. End of the system prompt: small always-on cache. Survives Window
@@ -159,22 +160,30 @@ async def complete(
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
+    # Beta flags + endpoint selection. MCP and web_fetch each require their
+    # own opt-in header; web_search is GA but the beta endpoint accepts it
+    # the same as the standard endpoint, so we collapse the routing here.
+    betas: list[str] = []
     if mcp_servers:
-        response = await client.beta.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-            mcp_servers=mcp_servers,  # type: ignore[arg-type]
-            betas=["mcp-client-2025-04-04"],
-        )
+        betas.append("mcp-client-2025-04-04")
+    if tools and any(t.get("type", "").startswith("web_fetch") for t in tools):
+        betas.append("web-fetch-2025-09-10")
+
+    kwargs: dict = dict(
+        model=model,
+        system=system_blocks,
+        messages=cached_messages,
+        max_tokens=max_tokens,
+    )
+    if tools:
+        kwargs["tools"] = tools
+    if mcp_servers:
+        kwargs["mcp_servers"] = mcp_servers  # type: ignore[arg-type]
+
+    if betas:
+        response = await client.beta.messages.create(**kwargs, betas=betas)
     else:
-        response = await client.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-        )
+        response = await client.messages.create(**kwargs)
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
     text = "".join(text_parts)
