@@ -214,7 +214,12 @@ def md_to_html(text: str) -> str:
         return f"<blockquote>{chr(10).join(inner_lines)}</blockquote>\n"
     text = re.sub(r"(?:^&gt;[^\n]*(?:\n|$))+", _wrap_quote, text, flags=re.MULTILINE)
 
-    # 8. Bullet markers -> Unicode bullet, preserving indent.
+    # 8. Task lists before plain bullets -- `- [ ] task` -> ☐, `- [x] task` -> ☑.
+    # Without this they fall through to the bullet rule and the brackets show
+    # up as literal text after the bullet.
+    text = re.sub(r"^([ \t]*)[*-][ \t]+\[ \][ \t]+", r"\1☐ ", text, flags=re.MULTILINE)
+    text = re.sub(r"^([ \t]*)[*-][ \t]+\[[xX]\][ \t]+", r"\1☑ ", text, flags=re.MULTILINE)
+    # 9. Bullet markers -> Unicode bullet, preserving indent.
     text = re.sub(r"^([ \t]*)[*-][ \t]+", r"\1• ", text, flags=re.MULTILINE)
 
     # 9. Re-insert stashed content. Links first because their HTML may contain
