@@ -80,8 +80,8 @@ class Store:
         return self.media_dir(chat_id) / f"{message_id}.{ext}"
 
     def resolve_media(self, relative_path: str) -> Path:
-        target = self.data_dir / relative_path
-        if not target.is_relative_to(self.data_dir):
+        target = (self.data_dir / relative_path).resolve()
+        if target.is_absolute() or not target.is_relative_to(self.data_dir):
             raise ValueError(f"media path escapes data dir: {relative_path!r}")
         return target
 

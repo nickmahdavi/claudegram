@@ -58,11 +58,11 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 # Discard pings older than this many seconds
 STALE_PING_AGE_S = 60
 TELEGRAM_CHAR_LIMIT = 4096
-# Anthropic's vision API caps image source bytes at 10 MB. Telegram-compressed
-# photos are usually well under this, but cap defensively so a giant attachment
-# can't trip a downstream rejection.
+# Anthropic's vision API caps image source bytes at 10 MB (~7.5 mb b64).
+# Telegram-compressed photos are usually well under this, but cap defensively
+# so a giant attachment can't trip a downstream rejection.
 # TODO: Bedrock caps at 5 MB, for whenever we add Vertex support.
-PHOTO_MAX_BYTES = 10 * 1024 * 1024
+PHOTO_MAX_BYTES = 7 * 1024 * 1024
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -556,6 +556,10 @@ class Bot:
                         tmp.unlink(missing_ok=True)
                         return None
                     tmp.replace(target)
+        except httpx.HTTPError as e:
+            # Don't leak token
+            logger.warning("Photo download failed for chat %s msg %s: %s", chat_id, msg_id, type(e).__name__)
+            return None
         except Exception:
             logger.exception("Failed to download photo for chat %s msg %s", chat_id, msg_id)
             return None
