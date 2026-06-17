@@ -80,7 +80,10 @@ class Store:
         return self.media_dir(chat_id) / f"{message_id}.{ext}"
 
     def resolve_media(self, relative_path: str) -> Path:
-        return self.data_dir / relative_path
+        target = self.data_dir / relative_path
+        if not target.is_relative_to(self.data_dir):
+            raise ValueError(f"media path escapes data dir: {relative_path!r}")
+        return target
 
     @property
     def model_prefs_path(self) -> Path:
