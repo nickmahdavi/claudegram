@@ -23,6 +23,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+import urllib.parse
 
 from .commands import ActiveChat, CaptionCommand, MentionsMe, NotIgnored, RepliesToMe
 from .config import Config
@@ -534,7 +535,8 @@ class Bot:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             tg_file = await photo.get_file()
-            url = tg_file._get_encoded_url()
+            base = self.application.bot.base_file_url
+            url = f"{base}/{urllib.parse.quote(tg_file.file_path, safe='/')}"
             written = 0
             async with httpx.AsyncClient() as client:
                 resp = await client.head(url)
