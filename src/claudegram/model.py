@@ -186,7 +186,12 @@ async def complete(
         response = await client.messages.create(**kwargs)
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
-    text = "".join(text_parts)
+    # Tool-use responses interleave text and tool_use blocks. Joining text
+    # parts with "" smashes the pre-tool announcement ("On it!") into the
+    # post-tool synthesis ("Now let me search..."). Paragraph break preserves
+    # the natural beat the model intends between segments; single-text-block
+    # responses are unaffected.
+    text = "\n\n".join(p.rstrip() for p in text_parts if p.strip())
     block_types = [getattr(b, "type", "?") for b in response.content]
     usage = response.usage
 
