@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 class Store:
     def __init__(self, data_dir: PathLike, log_dir: PathLike, input_budget: int):
-        self.data_dir = Path(data_dir)
-        self.log_dir = Path(log_dir)
+        self.data_dir = Path(data_dir).resolve()
+        self.log_dir = Path(log_dir).resolve()
         self.input_budget = input_budget
         self.windows: dict[int, Window] = {}
 
@@ -81,7 +81,7 @@ class Store:
 
     def resolve_media(self, relative_path: str) -> Path:
         target = (self.data_dir / relative_path).resolve()
-        if target.is_absolute() or not target.is_relative_to(self.data_dir):
+        if Path(relative_path).is_absolute() or not target.is_relative_to(self.data_dir):
             raise ValueError(f"media path escapes data dir: {relative_path!r}")
         return target
 
