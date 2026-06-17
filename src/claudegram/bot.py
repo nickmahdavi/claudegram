@@ -63,6 +63,8 @@ TELEGRAM_CHAR_LIMIT = 4096
 # so a giant attachment can't trip a downstream rejection.
 # TODO: Bedrock caps at 5 MB, for whenever we add Vertex support.
 PHOTO_MAX_BYTES = 7 * 1024 * 1024
+# Reasonable limit (~100 kb/s)
+DL_TIMEOUT = 72
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -542,7 +544,7 @@ class Bot:
 
                 aborted = False
                 tmp = target.parent / (target.name + ".part")
-                async with client.stream("GET", url) as resp:
+                async with client.stream("GET", url, timeout=DL_TIMEOUT) as resp:
                     resp.raise_for_status()
                     with open(tmp, "wb") as f:
                         async for chunk in resp.aiter_bytes(65536):
