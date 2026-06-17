@@ -58,7 +58,7 @@ LOAD_MAX_BYTES = 18 * 1024 * 1024
 # Discard pings older than this many seconds
 STALE_PING_AGE_S = 60
 TELEGRAM_CHAR_LIMIT = 4096
-# Anthropic's vision API caps image source bytes at 10 MB (~7.5 mb b64).
+# Anthropic's vision API caps image source bytes at 10 MB (b64, so ~7.5 MB raw).
 # Telegram-compressed photos are usually well under this, but cap defensively
 # so a giant attachment can't trip a downstream rejection.
 # TODO: Bedrock caps at 5 MB, for whenever we add Vertex support.
