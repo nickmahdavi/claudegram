@@ -214,12 +214,23 @@ def md_to_html(text: str) -> str:
         return f"<blockquote>{chr(10).join(inner_lines)}</blockquote>\n"
     text = re.sub(r"(?:^&gt;[^\n]*(?:\n|$))+", _wrap_quote, text, flags=re.MULTILINE)
 
-    # 8. Task lists before plain bullets -- `- [ ] task` -> ☐, `- [x] task` -> ☑.
+    # 8. Horizontal rules. CommonMark accepts `---`, `***`, `___`, and the
+    # spaced variants (`* * *`, `- - -`) -- 3+ of the same marker char on a
+    # line on its own. Telegram has no <hr> element so we render an em-dash
+    # row that visually reads as a divider. Runs before task lists/bullets
+    # because those rules also chew on `*` and `-` at line start; HR is more
+    # specific (entire line, no other content) so it claims those lines first.
+    text = re.sub(
+        r"^[ \t]*([-*_])(?:[ \t]*\1){2,}[ \t]*$",
+        "—" * 16, text, flags=re.MULTILINE,
+    )
+
+    # 9. Task lists before plain bullets -- `- [ ] task` -> ☐, `- [x] task` -> ☑.
     # Without this they fall through to the bullet rule and the brackets show
     # up as literal text after the bullet.
     text = re.sub(r"^([ \t]*)[*-][ \t]+\[ \][ \t]+", r"\1☐ ", text, flags=re.MULTILINE)
     text = re.sub(r"^([ \t]*)[*-][ \t]+\[[xX]\][ \t]+", r"\1☑ ", text, flags=re.MULTILINE)
-    # 9. Bullet markers -> Unicode bullet, preserving indent.
+    # 10. Bullet markers -> Unicode bullet, preserving indent.
     text = re.sub(r"^([ \t]*)[*-][ \t]+", r"\1• ", text, flags=re.MULTILINE)
 
     # 9. Re-insert stashed content. Links first because their HTML may contain
