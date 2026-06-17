@@ -103,6 +103,14 @@ def get_prompt(
 
 _EPHEMERAL: CacheControlEphemeralParam = {"type": "ephemeral", "ttl": "1h"}
 
+# Map server-side tool types to the anthropic-beta header they require. Add a
+# new entry here when you wire a new beta-only tool into bot.SERVER_TOOLS.
+_TOOL_BETAS: dict[str, str] = {
+    "web_fetch_20250910": "web-fetch-2025-09-10",
+    "code_execution_20250522": "code-execution-2025-05-22",  # legacy (Python-only)
+    "code_execution_20250825": "code-execution-2025-08-25",  # current v2 (Python + bash + files)
+}
+
 
 def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessageParam]:
     """Return a shallow copy of `messages` with cache_control marked on the
@@ -160,14 +168,18 @@ async def complete(
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
-    # Beta flags + endpoint selection. MCP and web_fetch each require their
-    # own opt-in header; web_search is GA but the beta endpoint accepts it
-    # the same as the standard endpoint, so we collapse the routing here.
+    # Beta flags + endpoint selection. MCP and several server-side tools each
+    # require their own opt-in header; web_search is GA but the beta endpoint
+    # accepts it the same as the standard endpoint, so we collapse the routing
+    # here. Adding a new server-tool means adding the (tool_type -> beta_header)
+    # entry below and the tool dict in bot.SERVER_TOOLS.
     betas: list[str] = []
     if mcp_servers:
         betas.append("mcp-client-2025-04-04")
-    if tools and any(t.get("type", "").startswith("web_fetch") for t in tools):
-        betas.append("web-fetch-2025-09-10")
+    for tool in tools or []:
+        beta = _TOOL_BETAS.get(tool.get("type", ""))
+        if beta and beta not in betas:
+            betas.append(beta)
 
     kwargs: dict = dict(
         model=model,

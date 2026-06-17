@@ -43,7 +43,7 @@
 ### capabilities
 
 - [x] web search + web fetch
-- [ ] code execution + sandbox
+- [x] code execution + sandbox
 - [ ] memory
 - [x] media part 1 (photos to claude)-- base64 encode, image content blocks in `Window.history`, persist image bytes
 - [ ] media part 2: voice / video / document placeholders, voice transcription, render text files
