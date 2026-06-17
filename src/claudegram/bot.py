@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Coroutine, Literal, Optional
 from zoneinfo import ZoneInfo, available_timezones
 
+import httpx
 import telegram
 from telegram import Update, User
 from telegram.ext import (
@@ -530,7 +531,30 @@ class Bot:
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             tg_file = await photo.get_file()
-            await tg_file.download_to_drive(target)
+            url = tg_file._get_encoded_url()
+            written = 0
+            async with httpx.AsyncClient() as client:
+                resp = await client.head(url)
+                clen = resp.headers.get("content-length")
+                if clen and int(clen) > PHOTO_MAX_BYTES:
+                    return None
+
+                aborted = False
+                tmp = target.parent / (target.name + ".part")
+                async with client.stream("GET", url) as resp:
+                    resp.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        async for chunk in resp.aiter_bytes(65536):
+                            written += len(chunk)
+                            if written > PHOTO_MAX_BYTES:
+                                aborted = True
+                                break
+                            f.write(chunk)
+                    if aborted:
+                        logger.warning("Photo in chat %s exceeded %d bytes; aborting", chat_id, PHOTO_MAX_BYTES)
+                        tmp.unlink(missing_ok=True)
+                        return None
+                    tmp.replace(target)
         except Exception:
             logger.exception("Failed to download photo for chat %s msg %s", chat_id, msg_id)
             return None
