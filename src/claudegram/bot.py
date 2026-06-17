@@ -2,7 +2,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -509,12 +508,12 @@ class Bot:
     @staticmethod
     def _write_view_file(path, text: str) -> None:
         """Atomic overwrite (runs in a worker thread): write to a sibling tmp file
-        then os.replace it into place."""
+        then Path.replace it into place."""
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        tmp.replace(path)
 
     async def _download_photo(self, message: telegram.Message) -> Optional[Image]:
         """Pull the highest-resolution PhotoSize down to the chat's media dir
