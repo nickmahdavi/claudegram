@@ -120,6 +120,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "cryptography" },
+    { name = "httpx" },
     { name = "pydantic-settings" },
     { name = "python-dotenv" },
     { name = "python-telegram-bot" },
@@ -134,6 +135,7 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
     { name = "cryptography", specifier = ">=43" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic-settings", specifier = ">=2.14.1" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-telegram-bot", specifier = ">=22.0" },

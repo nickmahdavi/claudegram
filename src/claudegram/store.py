@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -19,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 class Store:
     def __init__(self, data_dir: PathLike, log_dir: PathLike, input_budget: int):
-        self.data_dir = Path(data_dir)
-        self.log_dir = Path(log_dir)
+        self.data_dir = Path(data_dir).resolve()
+        self.log_dir = Path(log_dir).resolve()
         self.input_budget = input_budget
         self.windows: dict[int, Window] = {}
 
@@ -68,6 +69,21 @@ class Store:
 
     def context_path(self, chat_id: int) -> Path:
         return self.log_dir / f"chat_{chat_id}.context.log"
+
+    def media_dir(self, chat_id: int) -> Path:
+        return self.data_dir / "media" / f"chat_{chat_id}"
+
+    def media_path(self, chat_id: int, message_id: int, ext: str) -> Path:
+        """Absolute path for a message's media file. `ext` is the extension
+        without leading dot (e.g. 'jpg'). Callers store the path relative to
+        data_dir in the Message; resolve_media flips it back to absolute."""
+        return self.media_dir(chat_id) / f"{message_id}.{ext}"
+
+    def resolve_media(self, relative_path: str) -> Path:
+        target = (self.data_dir / relative_path).resolve()
+        if Path(relative_path).is_absolute() or not target.is_relative_to(self.data_dir):
+            raise ValueError(f"media path escapes data dir: {relative_path!r}")
+        return target
 
     @property
     def model_prefs_path(self) -> Path:
@@ -387,6 +403,14 @@ class Store:
         os.replace(tmp, path)
         logger.info("Replaced chat %s history with %d message(s)", chat_id, len(messages))
 
+        # The replaced history references new message ids; the old per-message
+        # image files keyed on the OLD ids are now orphans. /load doesn't emit
+        # images yet (see TODO), so the imported set has nothing to preserve.
+        media = self.media_dir(chat_id)
+        if media.exists():
+            shutil.rmtree(media, ignore_errors=True)
+            logger.info("Cleared media dir (%s) for chat %s on replace", media, chat_id)
+
         self.windows.pop(chat_id, None)
         self._incarnation[chat_id] = self._incarnation.get(chat_id, 0) + 1
         return backup
@@ -415,5 +439,10 @@ class Store:
         if view_path.exists():
             view_path.unlink()
             logger.info("Deleted chat view log (%s) for chat %s", view_path, chat_id)
+
+        media = self.media_dir(chat_id)
+        if media.exists():
+            shutil.rmtree(media, ignore_errors=True)
+            logger.info("Deleted media dir (%s) for chat %s", media, chat_id)
 
         return (deleted_window, chat_exists, ctx_exists)
