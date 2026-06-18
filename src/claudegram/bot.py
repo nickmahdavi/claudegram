@@ -573,8 +573,12 @@ class Bot:
                 # memory. The up-front photo.file_size check is best-effort (that
                 # field is optional). base_file_url already carries the token.
                 url = f"{self.application.bot.base_file_url}/{tg_file._get_encoded_url()}"
+                # asyncio.timeout caps total wall-clock; the per-connect/read
+                # timeouts bound a server that stalls mid-transfer (accepts the
+                # connection but dribbles or stops sending bytes).
+                timeout = httpx.Timeout(PHOTO_DL_TIMEOUT_S, connect=10.0, read=30.0)
                 async with asyncio.timeout(PHOTO_DL_TIMEOUT_S):
-                    async with httpx.AsyncClient() as client:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
                         async with client.stream("GET", url) as resp:
                             resp.raise_for_status()
                             with open(tmp, "wb") as f:
