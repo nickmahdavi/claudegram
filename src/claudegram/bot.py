@@ -1183,10 +1183,11 @@ class Bot:
                 await self._say(ctx, "No chat-specific extension was set.", markdown=False)
             return
 
-        # CommandHandlers run in group 0, ahead of on_message's secret guard
-        # (group 1). A pasted key in `/sysprompt …` would otherwise be
-        # written verbatim into the per-chat config and rendered into every
-        # subsequent prompt. Drop + refuse.
+        # on_message's secret guard never sees this message: on_message is
+        # registered with `~filters.COMMAND` (so `/sysprompt …` is excluded from
+        # it entirely), which is exactly why we must re-check here. Without this
+        # guard a pasted key would be written verbatim into the per-chat config
+        # and rendered into every subsequent prompt. Drop + refuse.
         if _looks_like_secret(text):
             await self._drop_pasted_secret(ctx.message)
             return
@@ -1325,19 +1326,21 @@ class Bot:
         lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
         await self._say(ctx, "\n".join(lines), markdown=False)
 
-    @command(admin="always")
+    # Gated the same as /sysprompt (admin="in_groups", not "always"): anyone who
+    # can SET a chat extension must be able to view the result it produces,
+    # otherwise the /sysprompt success message points DM users at a command that
+    # silently denies them.
+    @command(admin="in_groups")
     async def command_showprompt(self, ctx: CommandCtx):
         window = self.store.window(ctx.chat_id)
-        base = self._base_prompt(
+        # Route through _view_system_prompt so this shows the FULL prompt the
+        # model receives -- base + changelog + any per-chat /sysprompt extension.
+        # Assembling it by hand here previously omitted the extension.
+        full = self._view_system_prompt(
             ctx.chat_id, window.snapshot(), ctx.is_private,
             ctx.user.id if ctx.is_private else None,
         )
-        rendered = self._render_changelog()
-        if rendered:
-            changelog_section = f"\n\n— Changelog —\n{rendered}"
-        else:
-            changelog_section = "\n\n— Changelog —\n(no entries yet)"
-        await self._say(ctx, base + changelog_section, markdown=False)
+        await self._say(ctx, full, markdown=False)
 
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
