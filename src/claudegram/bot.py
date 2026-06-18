@@ -418,11 +418,17 @@ class Bot:
         """Reply to a command with the system prefix. markdown=True is the
         common case; the credential/pool/billing commands pass markdown=False
         because they interpolate user-controlled display names, and Markdown
-        would let a name like *foo* break the whole send."""
-        await ctx.message.reply_text(
-            f"{self.config.system_prefix} {text}",
-            parse_mode="Markdown" if markdown else None,
-        )
+        would let a name like *foo* break the whole send.
+
+        Chunked to Telegram's 4096-char limit: an over-long reply (e.g.
+        /showprompt with a big base prompt + /sysprompt extension) would
+        otherwise raise BadRequest and -- with no error handler registered --
+        fail silently. The system prefix rides only on the first chunk."""
+        body = f"{self.config.system_prefix} {text}"
+        parse_mode = "Markdown" if markdown else None
+        chunks = [body[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(body), TELEGRAM_CHAR_LIMIT)] or [body]
+        for chunk in chunks:
+            await ctx.message.reply_text(chunk, parse_mode=parse_mode)
 
     def _should_write_view(self, chat_id: int, force: bool) -> bool:
         """Throttle gate for the view log. Returns True (and arms the clock) when a
@@ -455,10 +461,17 @@ class Bot:
     def _render_changelog(self) -> str:
         return "\n\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
 
-    def _build_system(self, base: str) -> str:
+    def _build_system(self, base: str, chat_id: int) -> str:
         rendered = self._render_changelog()
         changelog = rendered if rendered else "(no entries yet)"
-        return f"{base}\n\n— Changelog —\n{changelog}"
+        sections = [base, f"— Changelog —\n{changelog}"]
+        # Per-chat extension (set via /sysprompt). EXTENDS the default rather
+        # than overwriting -- appended after the changelog so it has the last
+        # word in the prompt.
+        custom = self.store.get_sys_prompt(chat_id)
+        if custom:
+            sections.append(f"— Chat-specific extension —\n{custom}")
+        return "\n\n".join(sections)
 
     def _base_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Base system prompt for this chat, without the changelog."""
@@ -481,7 +494,7 @@ class Bot:
 
     def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Full system prompt as the model sees it (base + changelog)."""
-        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id))
+        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id), chat_id)
 
     async def _write_chat_view(
         self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
@@ -871,7 +884,7 @@ class Bot:
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory
-        ))
+        ), incoming.chat_id)
 
         messages = render_history(
             snapshot, self.me, render_mode, self.store.resolve_user, display_tz,
@@ -1278,6 +1291,7 @@ class Bot:
             "`/reset`: wipe this chat's history",
             "`/save`: back up unsaved messages to disk",
             f"`/model [name]`: show or set the model for this chat{admin_note}",
+            f"`/sysprompt [text]`: extend the default system prompt for this chat (no args clears){admin_note}",
             f"`/load`: replace this chat's history with a Telegram Desktop `result.json`{admin_note}",
             "`/tz [name]`: show or set your timezone (IANA name, e.g. `America/New_York`)",
             "`/whoami`: show your telegram user id",
@@ -1339,6 +1353,45 @@ class Bot:
             chat_id, resolved, ctx.user.id,
         )
         await self._say(ctx, f"Set to `{resolved}` for this chat")
+
+    @command(admin="in_groups")
+    async def command_sysprompt(self, ctx: CommandCtx):
+        """Set / clear a per-chat addition to the system prompt.
+
+        The custom text is APPENDED to the default base prompt (after the
+        changelog) -- it extends, not replaces. With no args, the custom is
+        cleared and we fall back to the pure default."""
+        chat_id = ctx.chat_id
+        # PTB splits args by whitespace; rejoin so multi-word prompts come
+        # through intact.
+        text = " ".join(ctx.args).strip()
+
+        if not text:
+            had = self.store.clear_sys_prompt(chat_id)
+            if had:
+                await self._say(ctx, "Cleared chat-specific extension. Reverted to the default sysprompt.", markdown=False)
+            else:
+                await self._say(ctx, "No chat-specific extension was set.", markdown=False)
+            return
+
+        # on_message's secret guard never sees this message: on_message is
+        # registered with `~filters.COMMAND` (so `/sysprompt …` is excluded from
+        # it entirely), which is exactly why we must re-check here. Without this
+        # guard a pasted key would be written verbatim into the per-chat config
+        # and rendered into every subsequent prompt. Drop + refuse.
+        if _looks_like_secret(text):
+            await self._drop_pasted_secret(ctx.message)
+            return
+
+        self.store.set_sys_prompt(chat_id, text)
+        logger.info(
+            "Set sys prompt for chat %s to %d chars by user_id=%s",
+            chat_id, len(text), ctx.user.id,
+        )
+        await self._say(
+            ctx,
+            f"Set chat extension ({len(text)} chars). Use `/sysprompt` (no args) to clear; `/showprompt` to see the full prompt.",
+        )
 
     # ---- credential / pool / billing commands --------------------------
     # These interpolate user-controlled display names, so they send plain text
@@ -1464,19 +1517,21 @@ class Bot:
         lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
         await self._say(ctx, "\n".join(lines), markdown=False)
 
-    @command(admin="always")
+    # Gated the same as /sysprompt (admin="in_groups", not "always"): anyone who
+    # can SET a chat extension must be able to view the result it produces,
+    # otherwise the /sysprompt success message points DM users at a command that
+    # silently denies them.
+    @command(admin="in_groups")
     async def command_showprompt(self, ctx: CommandCtx):
         window = self.store.window(ctx.chat_id)
-        base = self._base_prompt(
+        # Route through _view_system_prompt so this shows the FULL prompt the
+        # model receives -- base + changelog + any per-chat /sysprompt extension.
+        # Assembling it by hand here previously omitted the extension.
+        full = self._view_system_prompt(
             ctx.chat_id, window.snapshot(), ctx.is_private,
             ctx.user.id if ctx.is_private else None,
         )
-        rendered = self._render_changelog()
-        if rendered:
-            changelog_section = f"\n\n— Changelog —\n{rendered}"
-        else:
-            changelog_section = "\n\n— Changelog —\n(no entries yet)"
-        await self._say(ctx, base + changelog_section, markdown=False)
+        await self._say(ctx, full, markdown=False)
 
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
@@ -1586,6 +1641,7 @@ class Bot:
         self.application.add_handler(CommandHandler("whoami", self.command_whoami), group=0)
         self.application.add_handler(CommandHandler("save", self.command_save), group=0)
         self.application.add_handler(CommandHandler("model", self.command_model), group=0)
+        self.application.add_handler(CommandHandler("sysprompt", self.command_sysprompt), group=0)
         self.application.add_handler(CommandHandler("tz", self.command_tz), group=0)
         self.application.add_handler(CommandHandler("help", self.command_help), group=0)
         self.application.add_handler(CommandHandler("setkey", self.command_setkey), group=0)

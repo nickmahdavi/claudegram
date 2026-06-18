@@ -4,9 +4,11 @@
 
 ### queued, minor
 
-- [ ] bot doesn't accumulate messages properly--
-    - [ ] a long reply from the user splits into many chunks, and claude responds to all
-    - [ ] multiple claude replies might send out-of-order
+- [x] bot doesn't accumulate messages properly--
+    - [x] a long reply from the user splits into many chunks, and claude responds to all
+    - [x] multiple claude replies might send out-of-order
+- [x] render Claude's markdown on Telegram (md→HTML converter, `parse_mode="HTML"`, paragraph-aware chunking)
+- [x] `/sysprompt [text]` per-chat extension to the default system prompt (no args clears)
 - [ ] repo currently has a lot of comment bloat from agents
     - [ ] same with some command / system text
 - [x] render Claude's markdown on Telegram (md→HTML converter, `parse_mode="HTML"`, paragraph-aware chunking)
