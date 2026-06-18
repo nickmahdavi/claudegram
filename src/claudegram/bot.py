@@ -556,23 +556,29 @@ class Bot:
             # on disk to keep the cap honest on this path too.
             if is_local_file(tg_file.file_path):
                 src = Path(tg_file.file_path)
-                if src.stat().st_size > PHOTO_MAX_BYTES:
+                src_size = await asyncio.to_thread(lambda: src.stat().st_size)
+                if src_size > PHOTO_MAX_BYTES:
                     logger.warning(
                         "Local photo for chat %s msg %s is %d bytes (> %d cap); "
                         "skipping image attachment",
-                        chat_id, msg_id, src.stat().st_size, PHOTO_MAX_BYTES,
+                        chat_id, msg_id, src_size, PHOTO_MAX_BYTES,
                     )
                     return None
-                tmp.write_bytes(src.read_bytes())
-                size = tmp.stat().st_size
+                # Offload the synchronous read+write so we don't stall the event
+                # loop (and PTB's update dispatch) on multi-MB disk I/O, matching
+                # the asyncio.to_thread convention used by _write_view_file.
+                await asyncio.to_thread(lambda: tmp.write_bytes(src.read_bytes()))
+                size = await asyncio.to_thread(lambda: tmp.stat().st_size)
             else:
-                # Remote Bot API: build the download URL via PTB's helper so the
-                # file_path is properly URL-encoded, then stream to disk, aborting
-                # the moment the running byte count crosses PHOTO_MAX_BYTES so a
-                # giant (or file_size=None) attachment can't be fully buffered in
-                # memory. The up-front photo.file_size check is best-effort (that
-                # field is optional). base_file_url already carries the token.
-                url = f"{self.application.bot.base_file_url}/{tg_file._get_encoded_url()}"
+                # Remote Bot API: PTB's get_file() already prepended base_file_url
+                # to file_path for remote files, and File._get_encoded_url() returns
+                # that full, URL-encoded download URL (not a suffix) — the same value
+                # PTB itself passes straight to request.retrieve(). So use it as-is;
+                # re-prepending base_file_url would double the URL and 404. We stream
+                # to disk, aborting the moment the running byte count crosses
+                # PHOTO_MAX_BYTES so a giant (or file_size=None) attachment can't be
+                # fully buffered in memory. The URL carries the token.
+                url = tg_file._get_encoded_url()
                 # asyncio.timeout caps total wall-clock; the per-connect/read
                 # timeouts bound a server that stalls mid-transfer (accepts the
                 # connection but dribbles or stops sending bytes).
@@ -581,7 +587,11 @@ class Bot:
                     async with httpx.AsyncClient(timeout=timeout) as client:
                         async with client.stream("GET", url) as resp:
                             resp.raise_for_status()
-                            with open(tmp, "wb") as f:
+                            # Open and write off-thread so per-chunk disk writes
+                            # don't block the event loop (see asyncio.to_thread note
+                            # on the local branch above).
+                            f = await asyncio.to_thread(open, tmp, "wb")
+                            try:
                                 async for chunk in resp.aiter_bytes(65536):
                                     size += len(chunk)
                                     if size > PHOTO_MAX_BYTES:
@@ -591,14 +601,16 @@ class Bot:
                                             chat_id, msg_id, PHOTO_MAX_BYTES,
                                         )
                                         return None
-                                    f.write(chunk)
+                                    await asyncio.to_thread(f.write, chunk)
+                            finally:
+                                await asyncio.to_thread(f.close)
             if size == 0:
                 logger.warning(
                     "Photo download for chat %s msg %s was empty; skipping image attachment",
                     chat_id, msg_id,
                 )
                 return None
-            tmp.replace(target)
+            await asyncio.to_thread(tmp.replace, target)
         except TimeoutError:
             logger.warning("Photo download timed out for chat %s msg %s", chat_id, msg_id)
             return None
@@ -614,7 +626,15 @@ class Bot:
                            chat_id, msg_id, type(e).__name__)
             return None
         finally:
-            tmp.unlink(missing_ok=True)  # no-op after a successful tmp.replace
+            # no-op after a successful tmp.replace. Guard it: a cleanup-time
+            # OSError (perms, read-only FS) must not propagate out of here and
+            # drop the whole inbound message — the contract is to degrade to
+            # text-only, never to crash the handler.
+            try:
+                await asyncio.to_thread(lambda: tmp.unlink(missing_ok=True))
+            except OSError as e:
+                logger.warning("Failed to clean up temp photo file for chat %s msg %s: %s",
+                               chat_id, msg_id, type(e).__name__)
         rel = target.relative_to(self.store.data_dir).as_posix()
         logger.info("Saved photo for chat %s msg %s to %s (%d bytes)",
                     chat_id, msg_id, rel, size)
