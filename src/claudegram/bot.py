@@ -22,7 +22,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-import urllib.parse
 
 from .commands import ActiveChat, CaptionCommand, MentionsMe, NotIgnored, RepliesToMe
 from .config import Config
@@ -63,8 +62,11 @@ TELEGRAM_CHAR_LIMIT = 4096
 # so a giant attachment can't trip a downstream rejection.
 # TODO: Bedrock caps at 5 MB, for whenever we add Vertex support.
 PHOTO_MAX_BYTES = 7 * 1024 * 1024
-# Reasonable limit (~100 kb/s)
-DL_TIMEOUT = 72
+# Overall wall-clock budget for a single photo download (~100 kb/s floor over
+# the ~7 MB cap). Applied as an asyncio.timeout around the whole stream so a
+# slow-drip server can't hold the coroutine open indefinitely, regardless of
+# httpx's per-read timeouts.
+PHOTO_DL_TIMEOUT_S = 72
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -532,43 +534,60 @@ class Bot:
             return None
         target = self.store.media_path(chat_id, msg_id, "jpg")
         target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.parent / (target.name + ".part")
+        size = 0
         try:
             tg_file = await photo.get_file()
-            base = self.application.bot.base_file_url
-            url = f"{base}/{urllib.parse.quote(tg_file.file_path, safe='/')}"
-            written = 0
-            async with httpx.AsyncClient() as client:
-                resp = await client.head(url)
-                clen = resp.headers.get("content-length")
-                if clen and int(clen) > PHOTO_MAX_BYTES:
-                    return None
-
-                aborted = False
-                tmp = target.parent / (target.name + ".part")
-                async with client.stream("GET", url, timeout=DL_TIMEOUT) as resp:
-                    resp.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        async for chunk in resp.aiter_bytes(65536):
-                            written += len(chunk)
-                            if written > PHOTO_MAX_BYTES:
-                                aborted = True
-                                break
-                            f.write(chunk)
-                    if aborted:
-                        logger.warning("Photo in chat %s exceeded %d bytes; aborting", chat_id, PHOTO_MAX_BYTES)
-                        tmp.unlink(missing_ok=True)
-                        return None
-                    tmp.replace(target)
-        except httpx.HTTPError as e:
-            # Don't leak token
+            # Build the download URL from the bot's public base_file_url (which
+            # already carries the token) plus the file_path Telegram handed us,
+            # rather than the private _get_encoded_url(). This is Bot-API-mode
+            # aware: base_file_url points at whichever server we're configured
+            # for. We then stream to disk, aborting the moment the running byte
+            # count crosses PHOTO_MAX_BYTES so a giant (or file_size=None)
+            # attachment can't be fully buffered in memory. The up-front
+            # photo.file_size check is best-effort (that field is optional).
+            url = f"{self.application.bot.base_file_url}/{tg_file.file_path}"
+            async with asyncio.timeout(PHOTO_DL_TIMEOUT_S):
+                async with httpx.AsyncClient() as client:
+                    async with client.stream("GET", url) as resp:
+                        resp.raise_for_status()
+                        with open(tmp, "wb") as f:
+                            async for chunk in resp.aiter_bytes(65536):
+                                size += len(chunk)
+                                if size > PHOTO_MAX_BYTES:
+                                    logger.warning(
+                                        "Photo in chat %s msg %s exceeded %d byte cap mid-stream; "
+                                        "aborting, skipping image attachment",
+                                        chat_id, msg_id, PHOTO_MAX_BYTES,
+                                    )
+                                    return None
+                                f.write(chunk)
+            if size == 0:
+                logger.warning(
+                    "Photo download for chat %s msg %s was empty; skipping image attachment",
+                    chat_id, msg_id,
+                )
+                return None
+            tmp.replace(target)
+        except TimeoutError:
+            logger.warning("Photo download timed out for chat %s msg %s", chat_id, msg_id)
+            return None
+        except (telegram.error.TelegramError, httpx.HTTPError) as e:
+            # Type only, never the exception value — both telegram's and httpx's
+            # error reprs can carry the token-bearing file URL into the logs.
             logger.warning("Photo download failed for chat %s msg %s: %s", chat_id, msg_id, type(e).__name__)
             return None
-        except Exception:
-            logger.exception("Failed to download photo for chat %s msg %s", chat_id, msg_id)
+        except Exception as e:
+            # Type only, never logger.exception — a traceback can carry the
+            # token-bearing request URL into the logs.
+            logger.warning("Unexpected error downloading photo for chat %s msg %s: %s",
+                           chat_id, msg_id, type(e).__name__)
             return None
+        finally:
+            tmp.unlink(missing_ok=True)  # no-op after a successful tmp.replace
         rel = target.relative_to(self.store.data_dir).as_posix()
         logger.info("Saved photo for chat %s msg %s to %s (%d bytes)",
-                    chat_id, msg_id, rel, photo.file_size or 0)
+                    chat_id, msg_id, rel, size)
         return Image(path=rel, media_type="image/jpeg")
 
     async def _drop_pasted_secret(self, message: telegram.Message) -> None:
