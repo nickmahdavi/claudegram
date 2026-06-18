@@ -33,6 +33,7 @@ from .credentials import (
     CredentialKind,
     CredentialStore,
 )
+from .format import chunk_markdown, md_to_html
 from .error import (
     ErrorClass,
     admin_failure_dm,
@@ -329,21 +330,21 @@ class Bot:
 
     async def _send(
         self,
-        reply: Callable[[str], Awaitable[Optional[telegram.Message]]],
+        reply: Callable[..., Awaitable[Optional[telegram.Message]]],
         incoming: Incoming,
         text: str,
         incarnation: int,
         display_tz: Optional[ZoneInfo],
     ):
-        """Send a model reply (chunked to Telegram's limit) and, if the chat's
-        history hasn't been swapped out from under us since we snapshotted
-        (incarnation match), persist it. `reply` is the bound send callable
-        (e.g. message.reply_text) so this stays decoupled from the Update."""
-        chunks = [text[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(text), TELEGRAM_CHAR_LIMIT)]
-        if len(chunks) > 1:
+        """Send a model reply (chunked to Telegram's limit, rendered as HTML)
+        and, if the chat's history hasn't been swapped out from under us since
+        we snapshotted (incarnation match), persist it. `reply` is the bound
+        send callable so this stays decoupled from the Update."""
+        md_chunks = chunk_markdown(text, TELEGRAM_CHAR_LIMIT)
+        if len(md_chunks) > 1:
             logger.info(
                 "Chunking reply for chat %s (%d chars -> %d pieces)",
-                incoming.chat_id, len(text), len(chunks),
+                incoming.chat_id, len(text), len(md_chunks),
             )
         async with self.store.lock(incoming.chat_id):
             # A concurrent /reset or /load while we were awaiting the model
@@ -353,7 +354,7 @@ class Bot:
             # pinged and deserves an answer) but don't persist it onto the new
             # window. We hold the lock across the whole send loop, so
             # the incarnation can't change again mid-loop.
-            # 
+            #
             # This is currently bullshit in 99% of cases
             stale = self.store.incarnation(incoming.chat_id) != incarnation
             if stale:
@@ -363,17 +364,39 @@ class Bot:
                     incoming.chat_id, incarnation, self.store.incarnation(incoming.chat_id),
                 )
             window = None if stale else self.store.window(incoming.chat_id)
-            for i, chunk in enumerate(chunks):
+            for i, md_chunk in enumerate(md_chunks):
                 first = i == 0
-                sent = await reply(chunk)
+                html_chunk = md_to_html(md_chunk)
+                if len(html_chunk) > TELEGRAM_CHAR_LIMIT:
+                    # HTML escaping bloated the chunk past the cap; ship it
+                    # plain rather than have Telegram reject. Rare in practice.
+                    logger.debug(
+                        "HTML expansion %d -> %d exceeded limit; sending chunk plain",
+                        len(md_chunk), len(html_chunk),
+                    )
+                    sent = await reply(md_chunk)
+                else:
+                    try:
+                        sent = await reply(html_chunk, parse_mode="HTML")
+                    except telegram.error.BadRequest as e:
+                        # Converter produced something Telegram won't accept
+                        # (typically an unbalanced tag from a markdown span
+                        # straddling a chunk boundary, or a URL with a banned
+                        # scheme). Retry without parse_mode so the user still
+                        # gets *something* legible.
+                        logger.warning("HTML send rejected for chat %s (%s); retrying plain",
+                                       incoming.chat_id, e)
+                        sent = await reply(md_chunk)
                 if sent is None or sent.text is None:
                     logger.warning("Chunk %d not sent for chat %s; skipping persist", i, incoming.chat_id)
                 elif window is not None:
+                    # Persist the markdown source, not Telegram's parsed plain
+                    # text -- future Claude turns see his own formatting.
                     window.append(Message(
                         id=sent.message_id,
                         ts=sent.date,
                         user_id=self.me.user_id,
-                        text=sent.text,
+                        text=md_chunk,
                         reply_to=incoming.message_id if first else None,
                         reply= Reply(
                             user_id=incoming.sender.user_id,
@@ -767,11 +790,12 @@ class Bot:
         # threaded with reply_to keeps the same threading reply_text gave us.
         bot = self.application.bot
 
-        async def reply(text: str) -> Optional[telegram.Message]:
+        async def reply(text: str, parse_mode: Optional[str] = None) -> Optional[telegram.Message]:
             return await bot.send_message(
                 chat_id=incoming.chat_id,
                 text=text,
                 reply_to_message_id=incoming.message_id,
+                parse_mode=parse_mode,
             )
 
         prompt_mode = PromptMode.CHAT_PRIVATE if incoming.is_private else PromptMode.CHAT
@@ -921,8 +945,12 @@ class Bot:
         if prior_failures:
             await self._notify_admins_recovered(incoming.chat_id, prior_failures)
 
-        if not completion.text:
-            logger.warning("Model returned empty reply for chat %s", incoming.chat_id)
+        # `.strip()` not just truthiness: a whitespace-only reply ("\n\n") is
+        # truthy but chunk_markdown drops it to zero chunks, so _send would
+        # silently send nothing and persist a "completed" turn. Treat it as
+        # empty here so the user isn't left in silence.
+        if not completion.text.strip():
+            logger.warning("Model returned empty/blank reply for chat %s", incoming.chat_id)
             return
 
         await self._send(reply, incoming, completion.text, incarnation, display_tz)
