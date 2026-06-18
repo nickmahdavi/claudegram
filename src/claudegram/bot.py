@@ -383,11 +383,17 @@ class Bot:
         """Reply to a command with the system prefix. markdown=True is the
         common case; the credential/pool/billing commands pass markdown=False
         because they interpolate user-controlled display names, and Markdown
-        would let a name like *foo* break the whole send."""
-        await ctx.message.reply_text(
-            f"{self.config.system_prefix} {text}",
-            parse_mode="Markdown" if markdown else None,
-        )
+        would let a name like *foo* break the whole send.
+
+        Chunked to Telegram's 4096-char limit: an over-long reply (e.g.
+        /showprompt with a big base prompt + /sysprompt extension) would
+        otherwise raise BadRequest and -- with no error handler registered --
+        fail silently. The system prefix rides only on the first chunk."""
+        body = f"{self.config.system_prefix} {text}"
+        parse_mode = "Markdown" if markdown else None
+        chunks = [body[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(body), TELEGRAM_CHAR_LIMIT)] or [body]
+        for chunk in chunks:
+            await ctx.message.reply_text(chunk, parse_mode=parse_mode)
 
     def _should_write_view(self, chat_id: int, force: bool) -> bool:
         """Throttle gate for the view log. Returns True (and arms the clock) when a
