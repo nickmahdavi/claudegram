@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo, available_timezones
 import httpx
 import telegram
 from telegram import Update, User
+from telegram._utils.files import is_local_file
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -538,30 +539,37 @@ class Bot:
         size = 0
         try:
             tg_file = await photo.get_file()
-            # Build the download URL from the bot's public base_file_url (which
-            # already carries the token) plus the file_path Telegram handed us,
-            # rather than the private _get_encoded_url(). This is Bot-API-mode
-            # aware: base_file_url points at whichever server we're configured
-            # for. We then stream to disk, aborting the moment the running byte
-            # count crosses PHOTO_MAX_BYTES so a giant (or file_size=None)
-            # attachment can't be fully buffered in memory. The up-front
-            # photo.file_size check is best-effort (that field is optional).
-            url = f"{self.application.bot.base_file_url}/{tg_file.file_path}"
-            async with asyncio.timeout(PHOTO_DL_TIMEOUT_S):
-                async with httpx.AsyncClient() as client:
-                    async with client.stream("GET", url) as resp:
-                        resp.raise_for_status()
-                        with open(tmp, "wb") as f:
-                            async for chunk in resp.aiter_bytes(65536):
-                                size += len(chunk)
-                                if size > PHOTO_MAX_BYTES:
-                                    logger.warning(
-                                        "Photo in chat %s msg %s exceeded %d byte cap mid-stream; "
-                                        "aborting, skipping image attachment",
-                                        chat_id, msg_id, PHOTO_MAX_BYTES,
-                                    )
-                                    return None
-                                f.write(chunk)
+            # When a local Bot API server is configured, Telegram hands back
+            # file_path as an absolute path to a file already on our disk, not a
+            # URL suffix; copy it straight across (this is what PTB's own
+            # download_to_drive does). file_size was checked above and the copy
+            # is bounded, so the streaming cap below isn't needed for this path.
+            if is_local_file(tg_file.file_path):
+                tmp.write_bytes(Path(tg_file.file_path).read_bytes())
+                size = tmp.stat().st_size
+            else:
+                # Remote Bot API: build the download URL via PTB's helper so the
+                # file_path is properly URL-encoded, then stream to disk, aborting
+                # the moment the running byte count crosses PHOTO_MAX_BYTES so a
+                # giant (or file_size=None) attachment can't be fully buffered in
+                # memory. The up-front photo.file_size check is best-effort (that
+                # field is optional). base_file_url already carries the token.
+                url = f"{self.application.bot.base_file_url}/{tg_file._get_encoded_url()}"
+                async with asyncio.timeout(PHOTO_DL_TIMEOUT_S):
+                    async with httpx.AsyncClient() as client:
+                        async with client.stream("GET", url) as resp:
+                            resp.raise_for_status()
+                            with open(tmp, "wb") as f:
+                                async for chunk in resp.aiter_bytes(65536):
+                                    size += len(chunk)
+                                    if size > PHOTO_MAX_BYTES:
+                                        logger.warning(
+                                            "Photo in chat %s msg %s exceeded %d byte cap mid-stream; "
+                                            "aborting, skipping image attachment",
+                                            chat_id, msg_id, PHOTO_MAX_BYTES,
+                                        )
+                                        return None
+                                    f.write(chunk)
             if size == 0:
                 logger.warning(
                     "Photo download for chat %s msg %s was empty; skipping image attachment",
