@@ -307,6 +307,12 @@ class Bot:
         self._ping_deadline: dict[int, float] = {}
         self._ping_pending: dict[int, Incoming] = {}
         self._ping_coalesced: dict[int, int] = {}
+        # Distinct senders (newest first) seen in the current window. We reply
+        # against the latest ping (`_ping_pending`) but a completion can be
+        # BILLED to any of these -- otherwise a no-credential user pinging last
+        # in a burst would coalesce the whole window onto their (refusable)
+        # ping and swallow a credentialed user's answerable request.
+        self._ping_senders: dict[int, list[UserInfo]] = {}
 
     async def _post_init(self, _: Application):
         try:
@@ -482,7 +488,10 @@ class Bot:
     ) -> None:
         """Rewrite the per-chat 'as the bot sees it' log: a 'System:' header with the
         chat's current system prompt, followed by the window rendered into H:/A:
-        turns -- the same shape sent to the model at ping time. Rendering runs on the
+        turns. This renders the window in its TRUE stored receive order (no
+        `for_completion` shaping) -- the model request may transiently reorder a
+        trailing reply to satisfy the API, but the log shows what actually
+        happened, including the bot's most recent reply at the tail. Rendering runs on the
         loop (it reads the store's identity table, which is only safe on the loop);
         the file write is offloaded with asyncio.to_thread and done via a tmp +
         os.replace swap so a reader never sees a torn/empty file. Because the swap
@@ -664,6 +673,12 @@ class Bot:
         self._ping_deadline[chat_id] = time.monotonic() + DEBOUNCE_S
         self._ping_pending[chat_id] = incoming
         self._ping_coalesced[chat_id] = self._ping_coalesced.get(chat_id, 0) + 1
+        # Track distinct senders newest-first: dedupe (a user firing three
+        # messages shouldn't appear three times) but keep the latest pinger at
+        # the head so billing prefers them when they CAN pay.
+        senders = self._ping_senders.get(chat_id, [])
+        senders = [incoming.sender] + [s for s in senders if s.user_id != incoming.sender.user_id]
+        self._ping_senders[chat_id] = senders
         task = self._ping_tasks.get(chat_id)
         if task is None or task.done():
             self._ping_tasks[chat_id] = asyncio.create_task(self._ping_runner(chat_id))
@@ -685,6 +700,7 @@ class Bot:
         self._ping_pending.pop(chat_id, None)
         self._ping_deadline.pop(chat_id, None)
         self._ping_coalesced.pop(chat_id, None)
+        self._ping_senders.pop(chat_id, None)
         task = self._ping_tasks.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
@@ -709,6 +725,7 @@ class Bot:
                 incoming = self._ping_pending.pop(chat_id, None)
                 self._ping_deadline.pop(chat_id, None)
                 coalesced = self._ping_coalesced.pop(chat_id, 0)
+                senders = self._ping_senders.pop(chat_id, [])
                 if incoming is None:
                     break
                 # on_ping's stale-check fires at QUEUE time. By the time the
@@ -736,7 +753,7 @@ class Bot:
                         coalesced, chat_id,
                     )
                 try:
-                    await self._run_completion(incoming)
+                    await self._run_completion(incoming, senders)
                 except Exception:
                     logger.exception("Debounced completion failed for chat %s", chat_id)
         finally:
@@ -751,11 +768,20 @@ class Bot:
                 self._ping_pending.pop(chat_id, None)
                 self._ping_deadline.pop(chat_id, None)
                 self._ping_coalesced.pop(chat_id, None)
+                self._ping_senders.pop(chat_id, None)
 
-    async def _run_completion(self, incoming: Incoming) -> None:
+    async def _run_completion(self, incoming: Incoming, senders: Optional[list[UserInfo]] = None) -> None:
         """Fire one completion for the most recent ping in a debounce window.
         Sends its own system replies for credential refusals -- on_ping no
-        longer awaits us, so the @incoming Outgoing plumbing is gone."""
+        longer awaits us, so the @incoming Outgoing plumbing is gone.
+
+        `senders` is the distinct set of pingers (newest first) coalesced into
+        this window; the reply targets `incoming` (the latest) but billing may
+        fall back to any of them, so a no-credential latest-pinger doesn't
+        swallow a credentialed user's answerable request. Defaults to just the
+        latest sender for callers outside the debounce path."""
+        if not senders:
+            senders = [incoming.sender]
         # /stop during the debounce window means the user explicitly asked us
         # to go silent between queueing and firing. Respect it -- no reply.
         if not self.store.is_active(incoming.chat_id):
@@ -779,13 +805,29 @@ class Bot:
 
         logger.info("Firing completion for chat %s", incoming.chat_id)
 
-        # Resolve whose credential pays for this ping. None => polite refusal,
-        # and crucially we must NOT touch the failure-streak/admin-alert
-        # machinery (that tracks only the bot's pool key). Done before any
-        # prompt building or typing indicator so a refusal is cheap and silent.
-        cred = self.credentials.resolve_credential(incoming.sender.user_id, incoming.chat_id, incoming.is_private)
+        # Resolve whose credential pays for this completion. The window may have
+        # coalesced several pingers; bill to the first one who CAN pay, newest
+        # first, so a no-credential latest-pinger doesn't refuse a window that a
+        # credentialed earlier pinger would have gotten answered. Only refuse if
+        # NOBODY in the window has a credential. None => polite refusal, and
+        # crucially we must NOT touch the failure-streak/admin-alert machinery
+        # (that tracks only the bot's pool key). Done before any prompt building
+        # or typing indicator so a refusal is cheap and silent.
+        cred = None
+        for sender in senders:
+            cred = self.credentials.resolve_credential(sender.user_id, incoming.chat_id, incoming.is_private)
+            if cred is not None:
+                if sender.user_id != incoming.sender.user_id:
+                    logger.info(
+                        "Billing chat %s completion to %s (latest pinger %s has no credential)",
+                        incoming.chat_id, sender.user_id, incoming.sender.user_id,
+                    )
+                break
         if cred is None:
-            logger.info("No credential for user %s in chat %s; refusing", incoming.sender.user_id, incoming.chat_id)
+            logger.info(
+                "No credential for any of %d pinger(s) in chat %s; refusing",
+                len(senders), incoming.chat_id,
+            )
             await reply(f"{self.config.system_prefix} {no_credential_reply(incoming.is_private)}")
             return
         try:
@@ -827,10 +869,13 @@ class Bot:
             tz_directory=tz_directory
         ))
 
-        messages = render_history(snapshot, self.me, render_mode, self.store.resolve_user, display_tz)
+        messages = render_history(
+            snapshot, self.me, render_mode, self.store.resolve_user, display_tz,
+            for_completion=True,
+        )
         if not messages:
             logger.info(
-                "Nothing to reply to in chat %s (window has no user turn after trim); skipping",
+                "Nothing to reply to in chat %s (window has no user turn after shaping); skipping",
                 incoming.chat_id,
             )
             return
