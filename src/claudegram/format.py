@@ -156,13 +156,16 @@ def md_to_html(text: str) -> str:
             html = f"<pre>{body}</pre>"
         fences.append(html)
         return code_slot(len(fences) - 1)
-    # The closing fence must be a ``` at the START of a line (optionally
-    # indented), not just the next ``` anywhere -- otherwise a body that itself
-    # contains ``` (Claude explaining markdown, a heredoc, a docstring) closes
-    # the block early and the remainder leaks as literal text. `\Z` also lets an
-    # unterminated final fence run to end-of-string instead of failing to match.
+    # BOTH fences must be a ``` at the START of a line (up to 3 spaces indent,
+    # per CommonMark) -- matching `_code_mask`'s `_FENCE_RE` so the masker and the
+    # stasher agree on what a fence is. Anchoring the *open* stops a mid-line ```
+    # in prose ("use ```python ...") from opening a block; anchoring the *close*
+    # stops a body that itself contains ``` (Claude explaining markdown, a
+    # heredoc, a docstring) from closing early. `\Z` lets a genuinely
+    # unterminated final fence (a reply cut off mid-code-block) still render as
+    # code instead of failing to match and leaking the body as literal text.
     text = re.sub(
-        r"```([^\n]*)\n(.*?)(?:\n[ \t]*```|\Z)",
+        r"(?m)^[ \t]{0,3}```([^\n]*)\n(.*?)(?:\n[ \t]{0,3}```|\Z)",
         _stash_pre, text, flags=re.DOTALL,
     )
 
@@ -326,6 +329,14 @@ def chunk_markdown(text: str, limit: int) -> list[str]:
     if len(text) <= limit:
         return [text] if text.strip() else []
 
+    # Reserve headroom for the synthetic ``` markers _balance_fences may add to a
+    # chunk that splits a code block (up to "```\n" prepended + "\n```" appended =
+    # 8 chars). Splitting against the reduced limit keeps the *balanced* chunk
+    # within the real limit so the send isn't rejected. Single-chunk text (handled
+    # above) never gets a synthetic fence, so it keeps the full limit.
+    _FENCE_MARGIN = 8
+    limit = max(1, limit - _FENCE_MARGIN)
+
     code_mask = _code_mask(text)
     def safe_split(cut: int) -> bool:
         # A split is safe iff the byte immediately before AND after are both
@@ -375,4 +386,39 @@ def chunk_markdown(text: str, limit: int) -> list[str]:
     tail = text[rest_start:].strip("\r\n")
     if tail.strip():
         chunks.append(tail)
-    return chunks
+    return _balance_fences(chunks)
+
+
+def _balance_fences(chunks: list[str]) -> list[str]:
+    """Repair fenced code blocks split across a chunk boundary.
+
+    When a single code block is longer than the limit, chunk_markdown is forced
+    to hard-cut inside it: the leading chunk ends with an unclosed ``` and the
+    trailing chunk begins mid-body with the real closing ``` orphaned at its end.
+    md_to_html would then (a) leave the leading chunk's open fence to run to \\Z
+    -- fine -- but (b) reparse the trailing chunk's orphaned ``` as a *new*
+    opening fence and wrap whatever follows (often plain prose) in <pre>.
+
+    Walk the chunks tracking fence parity (line-anchored ``` count, matching
+    _FENCE_RE). A chunk that ends still inside a block gets a synthetic closing
+    ```; the next chunk, which continues that block, gets a synthetic opening ```
+    so both render as code and neither has an orphaned fence. The language hint
+    is lost on the continuation (Telegram shows it as un-highlighted code), which
+    is a fair trade for not mangling the body."""
+    out: list[str] = []
+    in_block = False
+    for chunk in chunks:
+        if in_block:
+            # Continuation of a block cut from the previous chunk: reopen it so
+            # the leading ``` isn't read as a *closing* fence (and the trailing
+            # real ``` then as an opening one).
+            chunk = "```\n" + chunk
+        # Count line-anchored fences (matching _FENCE_RE, the same rule the
+        # stasher and _code_mask use). Odd count => the chunk ends inside a block.
+        fence_count = sum(1 for ln in chunk.split("\n") if _FENCE_RE.match(ln))
+        ends_in_block = (fence_count % 2) == 1
+        if ends_in_block:
+            chunk = chunk.rstrip("\n") + "\n```"
+        out.append(chunk)
+        in_block = ends_in_block
+    return out
