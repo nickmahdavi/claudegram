@@ -97,6 +97,33 @@ def _is_balanced(html: str) -> bool:
     return not stack
 
 
+def _apply_emphasis(text: str) -> str:
+    """Apply inline emphasis spans to already-HTML-escaped text.
+
+    Bold (`**`), underline (`__`), italic (`*`/`_`), strike (`~~`), spoiler
+    (`||`). The content boundary class forbids whitespace AND the marker char at
+    the *edges*, so `* a *` (internal-whitespace bullet) doesn't match, a bullet
+    at line start (`* item`) doesn't match, and `** ab **` can't grab `* ab *` as
+    italic content. Doubled markers run before single so `*` pairs aren't eaten
+    by the italic pass.
+
+    Bold and italic permit a *single* inner marker char so a nested opposite
+    span survives: `**see *also* this**` -> `<b>see <i>also</i> this</b>`.
+    Without the inner `*`, `[^*\\n]` rejected the whole span and it fell through
+    as literal markdown. Shared by the body pass and the link-display pass so
+    formatting inside `[ ... ](url)` matches formatting everywhere else."""
+    # Interior allows a lone `*` (so a nested `*italic*` survives) but never a
+    # `**`, so `**a** and **b**` stays two separate bolds rather than one span
+    # swallowing the markers between them.
+    text = re.sub(r"\*\*([^*\s\n](?:(?:[^*\n]|\*(?!\*))*?[^*\s\n])?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"(?<![_\w])__([^_\s\n](?:[^_\n]*?[^_\s\n])?)__(?!\w)", r"<u>\1</u>", text)
+    text = re.sub(r"(?<![*\w])\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![_\w])_([^_\s\n](?:[^_\n]*?[^_\s\n])?)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~([^~\s\n](?:[^~\n]*?[^~\s\n])?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"\|\|([^|\s\n](?:[^|\n]*?[^|\s\n])?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
+    return text
+
+
 def md_to_html(text: str) -> str:
     """Convert CommonMark-ish markdown to Telegram HTML.
 
@@ -129,7 +156,15 @@ def md_to_html(text: str) -> str:
             html = f"<pre>{body}</pre>"
         fences.append(html)
         return code_slot(len(fences) - 1)
-    text = re.sub(r"```([^\n]*)\n?(.*?)```", _stash_pre, text, flags=re.DOTALL)
+    # The closing fence must be a ``` at the START of a line (optionally
+    # indented), not just the next ``` anywhere -- otherwise a body that itself
+    # contains ``` (Claude explaining markdown, a heredoc, a docstring) closes
+    # the block early and the remainder leaks as literal text. `\Z` also lets an
+    # unterminated final fence run to end-of-string instead of failing to match.
+    text = re.sub(
+        r"```([^\n]*)\n(.*?)(?:\n[ \t]*```|\Z)",
+        _stash_pre, text, flags=re.DOTALL,
+    )
 
     # 2. Stash inline code.
     inlines: list[str] = []
@@ -166,7 +201,12 @@ def md_to_html(text: str) -> str:
                 out.append(s[i])
                 i += 1
                 continue
-            links.append(f'<a href="{_escape_attr(url)}">{_escape_html(disp)}</a>')
+            # Run emphasis on the display text too, so `[**bold**](url)` renders
+            # bold inside the link rather than showing literal `**`. Escape first
+            # (same as body text); inline-code slots already embedded in `disp`
+            # pass through untouched and resolve on re-insertion.
+            disp_html = _apply_emphasis(_escape_html(disp))
+            links.append(f'<a href="{_escape_attr(url)}">{disp_html}</a>')
             out.append(link_slot(len(links) - 1))
             i = url_end + 1
         return "".join(out)
@@ -175,18 +215,8 @@ def md_to_html(text: str) -> str:
     # 4. Escape what survives stashing.
     text = _escape_html(text)
 
-    # 5. Bold (`**`), underline (`__`), italic (`*` or `_`), strike (`~~`),
-    # spoiler (`||`). Content boundary class forbids whitespace AND the
-    # marker char itself, so `* a *` (internal whitespace) doesn't match,
-    # bullets at line start (`* item`) don't match, and `** ab **` can't
-    # grab `* ab *` as its italic content. Doubled markers run before single
-    # so the `*` pairs aren't consumed by the italic pass.
-    text = re.sub(r"\*\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*\*", r"<b>\1</b>", text)
-    text = re.sub(r"(?<![_\w])__([^_\s\n](?:[^_\n]*?[^_\s\n])?)__(?!\w)", r"<u>\1</u>", text)
-    text = re.sub(r"(?<![*\w])\*([^*\s\n](?:[^*\n]*?[^*\s\n])?)\*(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"(?<![_\w])_([^_\s\n](?:[^_\n]*?[^_\s\n])?)_(?!\w)", r"<i>\1</i>", text)
-    text = re.sub(r"~~([^~\s\n](?:[^~\n]*?[^~\s\n])?)~~", r"<s>\1</s>", text)
-    text = re.sub(r"\|\|([^|\s\n](?:[^|\n]*?[^|\s\n])?)\|\|", r"<tg-spoiler>\1</tg-spoiler>", text)
+    # 5. Apply emphasis (bold/underline/italic/strike/spoiler) to the body.
+    text = _apply_emphasis(text)
 
     # 6. Headers AFTER emphasis. Strip any inner `<b>` tags from the body
     # before wrapping, otherwise `## **Foo**` becomes `<b><b>Foo</b></b>` which
@@ -287,6 +317,12 @@ def chunk_markdown(text: str, limit: int) -> list[str]:
     md_to_html can't stash it, so the body would leak. Empty chunks are
     dropped so a leading newline doesn't produce a zero-length send (which
     the Telegram API rejects)."""
+    if limit <= 0:
+        # A non-positive limit can't make progress: the boundary search and the
+        # hard-cut both collapse to rest_start, so the loop would spin forever.
+        # No caller does this (TELEGRAM_CHAR_LIMIT is a fixed 4096) -- guard it
+        # anyway so a future misuse fails loudly instead of pinning a core.
+        raise ValueError(f"chunk_markdown requires a positive limit, got {limit}")
     if len(text) <= limit:
         return [text] if text.strip() else []
 
@@ -322,16 +358,21 @@ def chunk_markdown(text: str, limit: int) -> list[str]:
             # and retries plain text for this chunk.
             cut = window_end
 
-        chunk = text[rest_start:cut].strip()
-        if chunk:
+        # Strip only newlines at the edges, not spaces/tabs: a chunk that begins
+        # with an indented sub-bullet (`  - nested`) must keep its leading
+        # indent, or md_to_html promotes it to a top-level bullet and the
+        # nesting (in both the render and the persisted markdown) is lost.
+        chunk = text[rest_start:cut].strip("\r\n")
+        if chunk.strip():
             chunks.append(chunk)
         rest_start = cut
-        # Skip leading whitespace on the next chunk so we don't emit a chunk
-        # that's nothing but a line break.
-        while rest_start < len(text) and text[rest_start] in " \t\n":
+        # Skip blank-line runs before the next chunk so we don't emit a chunk
+        # that's nothing but a line break -- but stop at the first content line,
+        # indentation included.
+        while rest_start < len(text) and text[rest_start] in "\r\n":
             rest_start += 1
 
-    tail = text[rest_start:].strip()
-    if tail:
+    tail = text[rest_start:].strip("\r\n")
+    if tail.strip():
         chunks.append(tail)
     return chunks

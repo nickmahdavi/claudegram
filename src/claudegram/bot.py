@@ -788,8 +788,12 @@ class Bot:
         if prior_failures:
             await self._notify_admins_recovered(incoming.chat_id, prior_failures)
 
-        if not completion.text:
-            logger.warning("Model returned empty reply for chat %s", incoming.chat_id)
+        # `.strip()` not just truthiness: a whitespace-only reply ("\n\n") is
+        # truthy but chunk_markdown drops it to zero chunks, so _send would
+        # silently send nothing and persist a "completed" turn. Treat it as
+        # empty here so the user isn't left in silence.
+        if not completion.text.strip():
+            logger.warning("Model returned empty/blank reply for chat %s", incoming.chat_id)
             return
 
         await self._send(reply, incoming, completion.text, incarnation, display_tz)
