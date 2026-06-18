@@ -539,13 +539,31 @@ class Bot:
         size = 0
         try:
             tg_file = await photo.get_file()
+            if not tg_file.file_path:
+                # file_path is optional on PTB's File; without it we have neither
+                # a local path nor a URL suffix to fetch. PTB's own
+                # download_to_drive raises here; we degrade to text-only instead.
+                logger.warning(
+                    "Photo in chat %s msg %s has no file_path; skipping image attachment",
+                    chat_id, msg_id,
+                )
+                return None
             # When a local Bot API server is configured, Telegram hands back
             # file_path as an absolute path to a file already on our disk, not a
             # URL suffix; copy it straight across (this is what PTB's own
-            # download_to_drive does). file_size was checked above and the copy
-            # is bounded, so the streaming cap below isn't needed for this path.
+            # download_to_drive does). The up-front photo.file_size check is
+            # best-effort (that field is optional), so re-check the actual size
+            # on disk to keep the cap honest on this path too.
             if is_local_file(tg_file.file_path):
-                tmp.write_bytes(Path(tg_file.file_path).read_bytes())
+                src = Path(tg_file.file_path)
+                if src.stat().st_size > PHOTO_MAX_BYTES:
+                    logger.warning(
+                        "Local photo for chat %s msg %s is %d bytes (> %d cap); "
+                        "skipping image attachment",
+                        chat_id, msg_id, src.stat().st_size, PHOTO_MAX_BYTES,
+                    )
+                    return None
+                tmp.write_bytes(src.read_bytes())
                 size = tmp.stat().st_size
             else:
                 # Remote Bot API: build the download URL via PTB's helper so the
