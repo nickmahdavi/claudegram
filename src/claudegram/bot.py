@@ -817,10 +817,15 @@ class Bot:
         for sender in senders:
             cred = self.credentials.resolve_credential(sender.user_id, incoming.chat_id, incoming.is_private)
             if cred is not None:
-                if sender.user_id != incoming.sender.user_id:
+                # Log against cred.user_id, the party actually billed -- not the
+                # iterated sender. They diverge under CHAT_DESIGNATED billing
+                # (resolve_credential ignores the sender and returns the
+                # designated user) and whenever the fallback skipped past a
+                # no-credential latest pinger.
+                if cred.user_id != incoming.sender.user_id:
                     logger.info(
-                        "Billing chat %s completion to %s (latest pinger %s has no credential)",
-                        incoming.chat_id, sender.user_id, incoming.sender.user_id,
+                        "Billing chat %s completion to %s (latest pinger %s did not resolve a credential)",
+                        incoming.chat_id, cred.user_id, incoming.sender.user_id,
                     )
                 break
         if cred is None:
@@ -834,7 +839,7 @@ class Bot:
             client = self.credentials.client_for(cred)
         except Exception:
             logger.exception(
-                "Failed to build client for cred kind=%s user=%s", cred.kind.value, incoming.sender.user_id,
+                "Failed to build client for cred kind=%s user=%s", cred.kind.value, cred.user_id,
             )
             await reply(f"{self.config.system_prefix} {credential_broken_reply()}")
             return
