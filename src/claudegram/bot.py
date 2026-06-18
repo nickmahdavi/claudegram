@@ -356,11 +356,19 @@ class Bot:
         text: str,
         incarnation: int,
         display_tz: Optional[ZoneInfo],
+        thread_to_sender: bool = True,
     ):
         """Send a model reply (chunked to Telegram's limit) and, if the chat's
         history hasn't been swapped out from under us since we snapshotted
         (incarnation match), persist it. `reply` is the bound send callable
-        (e.g. message.reply_text) so this stays decoupled from the Update."""
+        (e.g. message.reply_text) so this stays decoupled from the Update.
+
+        `thread_to_sender` records the persisted Reply quote pinning this reply
+        to `incoming`. It is False when the window coalesced multiple DISTINCT
+        senders: the completion answered the whole burst, not `incoming`'s
+        message specifically, so pinning the record to the latest pinger (who
+        may be an unrelated user) would misrepresent it. The matching Telegram
+        reply-arrow suppression lives in the `reply` closure the caller builds."""
         chunks = [text[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(text), TELEGRAM_CHAR_LIMIT)]
         if len(chunks) > 1:
             logger.info(
@@ -396,13 +404,13 @@ class Bot:
                         ts=sent.date,
                         user_id=self.me.user_id,
                         text=sent.text,
-                        reply_to=incoming.message_id if first else None,
+                        reply_to=incoming.message_id if (first and thread_to_sender) else None,
                         reply= Reply(
                             user_id=incoming.sender.user_id,
                             text=incoming.text,
                             is_quote=False,
                             ts=incoming.date
-                        ) if first else None
+                        ) if (first and thread_to_sender) else None
                     ))
             view_snapshot = None
             if window is not None:
@@ -793,11 +801,22 @@ class Bot:
 
         bot = self.application.bot
 
+        # When the window coalesced more than one DISTINCT sender, the reply
+        # answers the whole burst -- threading the Telegram reply-arrow to the
+        # latest ping would point it at whoever happened to ping last, who may
+        # be an unrelated user (Alice asks the question, Bob says "lol" 0.5s
+        # later). Post without an arrow in that case. A single-sender burst (one
+        # user firing several messages, or Telegram splitting a long send) still
+        # threads to the latest ping, which is correct and useful. `senders` is
+        # already deduped by user_id, so len > 1 means distinct users.
+        thread_to_sender = len(senders) <= 1
+        reply_to_id = incoming.message_id if thread_to_sender else None
+
         async def reply(text: str) -> Optional[telegram.Message]:
             return await bot.send_message(
                 chat_id=incoming.chat_id,
                 text=text,
-                reply_to_message_id=incoming.message_id,
+                reply_to_message_id=reply_to_id,
             )
 
         prompt_mode = PromptMode.CHAT_PRIVATE if incoming.is_private else PromptMode.CHAT
@@ -956,7 +975,7 @@ class Bot:
             logger.warning("Model returned empty reply for chat %s", incoming.chat_id)
             return
 
-        await self._send(reply, incoming, completion.text, incarnation, display_tz)
+        await self._send(reply, incoming, completion.text, incarnation, display_tz, thread_to_sender)
 
 
     async def _handle_completion_error(
