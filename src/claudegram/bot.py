@@ -736,22 +736,26 @@ class Bot:
                 senders = self._ping_senders.pop(chat_id, [])
                 if incoming is None:
                     break
-                # on_ping's stale-check fires at QUEUE time. By the time the
-                # debounce window expires + the previous completion finishes,
-                # /load may have advanced last_load_at past this ping's date,
-                # or the user's stale-cutoff (STALE_PING_AGE_S) may have crept
-                # past it. Re-check so we don't reply to something the chat
-                # state has explicitly moved past.
+                # Re-check only against state that EXPLICITLY moved past this
+                # ping since it was queued: a /load advancing last_load_at, or
+                # (defensively) the process start boundary. We deliberately do
+                # NOT re-apply the rolling STALE_PING_AGE_S cutoff here. That
+                # cutoff exists to drop messages that piled up while the bot was
+                # down or stuck, and on_ping already applied it at QUEUE time
+                # when this ping first arrived live. By fire time the only thing
+                # that aged this ping is OUR OWN debounce window + a possibly
+                # slow preceding completion -- self-inflicted latency the user
+                # shouldn't be punished for. Re-applying the rolling cutoff here
+                # would silently drop a perfectly valid ping that merely waited
+                # its turn behind a slow completion (>STALE_PING_AGE_S).
                 now = datetime.now(UTC)
                 last_load = self.store.get_last_load_at(chat_id)
-                cutoff = max(filter(None, [
-                    self.start_time,
-                    now - timedelta(seconds=STALE_PING_AGE_S),
-                    last_load,
-                ]))
-                if incoming.date < cutoff:
+                # default=None: with the rolling term gone, both remaining
+                # bounds can be absent, and max() of an empty iterable raises.
+                cutoff = max(filter(None, [self.start_time, last_load]), default=None)
+                if cutoff is not None and incoming.date < cutoff:
                     logger.info(
-                        "Dropping post-debounce stale ping in chat %s (age=%.1fs)",
+                        "Dropping post-debounce ping in chat %s; chat state moved past it (age=%.1fs)",
                         chat_id, (now - incoming.date).total_seconds(),
                     )
                     continue
