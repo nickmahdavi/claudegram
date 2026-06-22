@@ -151,11 +151,43 @@ def render_history(
     display_tz: Optional[ZoneInfo] = None,
     resolve_media: Optional[MediaResolver] = None,
     embed_images: bool = True,
+    *,
+    for_completion: bool = False,
 ) -> list[MessageParam]:
     if mode == RenderMode.CHAT:
         hist = list(messages)
-        while hist and hist[0].user_id == bot_info.user_id:
-            hist.pop(0)
+        if for_completion:
+            # Shape the list for the API WITHOUT mutating stored order. The
+            # window is persisted in true receive order; but a ping that
+            # arrived during the previous completion's API call lands BEFORE
+            # that completion's reply in the window (on_message wins the chat
+            # lock against the in-flight _send), so the snapshot can look like
+            # [U1, U2, B1] -- a trailing assistant turn the API rejects ("must
+            # end with user message").
+            #
+            # Rather than DROP the bot's own reply (which strips it from
+            # context and lets the model re-answer U1), MOVE the trailing
+            # assistant run to just before the last user turn:
+            #   [U1, U2, B1] -> [U1, B1, U2]
+            # The model keeps its prior reply in context and the request ends
+            # on a user turn. This reordering is ephemeral -- it touches only
+            # this request; disk and the view log keep the honest receive
+            # order. The last user turn is always at index start-1, since the
+            # trailing run is maximal (everything after start-1 is assistant).
+            end = len(hist)
+            start = end
+            while start > 0 and hist[start - 1].user_id == bot_info.user_id:
+                start -= 1
+            if 0 < start < end:
+                run = hist[start:]
+                last_user = hist[start - 1]
+                hist = hist[: start - 1] + run + [last_user]
+            # The first message must be a user turn (leading bot turns from
+            # eviction, or from the single-user-turn reorder edge above where a
+            # reply can't be preserved, are unrepresentable as a well-formed
+            # opening). Drop them.
+            while hist and hist[0].user_id == bot_info.user_id:
+                hist.pop(0)
 
         # Per message: (role, rendered_text, image-or-None). Bot messages never
         # carry an image; only the user side has one.

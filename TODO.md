@@ -11,7 +11,6 @@
 - [x] `/sysprompt [text]` per-chat extension to the default system prompt (no args clears)
 - [ ] repo currently has a lot of comment bloat from agents
     - [ ] same with some command / system text
-- [x] render Claude's markdown on Telegram (md→HTML converter, `parse_mode="HTML"`, paragraph-aware chunking)
 
 ## Claude wants
 
