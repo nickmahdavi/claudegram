@@ -2,7 +2,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import re
 import time
 from pathlib import Path
@@ -12,8 +11,10 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Coroutine, Literal, Optional
 from zoneinfo import ZoneInfo, available_timezones
 
+import httpx
 import telegram
 from telegram import Update, User
+from telegram._utils.files import is_local_file
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -32,6 +33,7 @@ from .credentials import (
     CredentialKind,
     CredentialStore,
 )
+from .format import chunk_markdown, md_to_html
 from .error import (
     ErrorClass,
     admin_failure_dm,
@@ -45,7 +47,7 @@ from .error import (
 )
 from .identity import UserInfo
 from .importer import parse_export
-from .message import UTC, Forward, Message, Reply
+from .message import UTC, Forward, Image, Message, Reply
 from .mcp import McpTokenManager
 from .model import MODEL_ALIASES, TRANSIENT_ERRORS, SUPPORTED_MODELS, SYSTEM_PROMPTS, PromptMode, complete, get_prompt
 from .render import RenderMode, build_tz_directory, fmt_offset, render_history
@@ -62,6 +64,16 @@ TELEGRAM_CHAR_LIMIT = 4096
 # Telegram splits long sends into multiple messages within a few hundred ms;
 # 1s easily catches the split without feeling laggy.
 DEBOUNCE_S = 1.0
+# Anthropic's vision API caps image source bytes at 10 MB (b64, so ~7.5 MB raw).
+# Telegram-compressed photos are usually well under this, but cap defensively
+# so a giant attachment can't trip a downstream rejection.
+# TODO: Bedrock caps at 5 MB, for whenever we add Vertex support.
+PHOTO_MAX_BYTES = 7 * 1024 * 1024
+# Overall wall-clock budget for a single photo download (~100 kb/s floor over
+# the ~7 MB cap). Applied as an asyncio.timeout around the whole stream so a
+# slow-drip server can't hold the coroutine open indefinitely, regardless of
+# httpx's per-read timeouts.
+PHOTO_DL_TIMEOUT_S = 72
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -173,8 +185,9 @@ def incoming(func: Callable[["Bot", Incoming], Awaitable[Optional[Outgoing]]]) -
         if not message or not message.from_user:
             return
 
-        text = message.text or message.caption
-        if not text:
+        text = message.text or message.caption or ""
+        has_media = bool(message.photo)
+        if not text and not has_media:
             return
 
         # Belt-and-suspenders: on_ping's registration already gates on the
@@ -351,17 +364,17 @@ class Bot:
 
     async def _send(
         self,
-        reply: Callable[[str], Awaitable[Optional[telegram.Message]]],
+        reply: Callable[..., Awaitable[Optional[telegram.Message]]],
         incoming: Incoming,
         text: str,
         incarnation: int,
         display_tz: Optional[ZoneInfo],
         thread_to_sender: bool = True,
     ):
-        """Send a model reply (chunked to Telegram's limit) and, if the chat's
-        history hasn't been swapped out from under us since we snapshotted
-        (incarnation match), persist it. `reply` is the bound send callable
-        (e.g. message.reply_text) so this stays decoupled from the Update.
+        """Send a model reply (chunked to Telegram's limit, rendered as HTML)
+        and, if the chat's history hasn't been swapped out from under us since
+        we snapshotted (incarnation match), persist it. `reply` is the bound
+        send callable so this stays decoupled from the Update.
 
         `thread_to_sender` records the persisted Reply quote pinning this reply
         to `incoming`. It is False when the window coalesced multiple DISTINCT
@@ -369,11 +382,11 @@ class Bot:
         message specifically, so pinning the record to the latest pinger (who
         may be an unrelated user) would misrepresent it. The matching Telegram
         reply-arrow suppression lives in the `reply` closure the caller builds."""
-        chunks = [text[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(text), TELEGRAM_CHAR_LIMIT)]
-        if len(chunks) > 1:
+        md_chunks = chunk_markdown(text, TELEGRAM_CHAR_LIMIT)
+        if len(md_chunks) > 1:
             logger.info(
                 "Chunking reply for chat %s (%d chars -> %d pieces)",
-                incoming.chat_id, len(text), len(chunks),
+                incoming.chat_id, len(text), len(md_chunks),
             )
         async with self.store.lock(incoming.chat_id):
             # A concurrent /reset or /load while we were awaiting the model
@@ -383,7 +396,7 @@ class Bot:
             # pinged and deserves an answer) but don't persist it onto the new
             # window. We hold the lock across the whole send loop, so
             # the incarnation can't change again mid-loop.
-            # 
+            #
             # This is currently bullshit in 99% of cases
             stale = self.store.incarnation(incoming.chat_id) != incarnation
             if stale:
@@ -393,17 +406,39 @@ class Bot:
                     incoming.chat_id, incarnation, self.store.incarnation(incoming.chat_id),
                 )
             window = None if stale else self.store.window(incoming.chat_id)
-            for i, chunk in enumerate(chunks):
+            for i, md_chunk in enumerate(md_chunks):
                 first = i == 0
-                sent = await reply(chunk)
+                html_chunk = md_to_html(md_chunk)
+                if len(html_chunk) > TELEGRAM_CHAR_LIMIT:
+                    # HTML escaping bloated the chunk past the cap; ship it
+                    # plain rather than have Telegram reject. Rare in practice.
+                    logger.debug(
+                        "HTML expansion %d -> %d exceeded limit; sending chunk plain",
+                        len(md_chunk), len(html_chunk),
+                    )
+                    sent = await reply(md_chunk)
+                else:
+                    try:
+                        sent = await reply(html_chunk, parse_mode="HTML")
+                    except telegram.error.BadRequest as e:
+                        # Converter produced something Telegram won't accept
+                        # (typically an unbalanced tag from a markdown span
+                        # straddling a chunk boundary, or a URL with a banned
+                        # scheme). Retry without parse_mode so the user still
+                        # gets *something* legible.
+                        logger.warning("HTML send rejected for chat %s (%s); retrying plain",
+                                       incoming.chat_id, e)
+                        sent = await reply(md_chunk)
                 if sent is None or sent.text is None:
                     logger.warning("Chunk %d not sent for chat %s; skipping persist", i, incoming.chat_id)
                 elif window is not None:
+                    # Persist the markdown source, not Telegram's parsed plain
+                    # text -- future Claude turns see his own formatting.
                     window.append(Message(
                         id=sent.message_id,
                         ts=sent.date,
                         user_id=self.me.user_id,
-                        text=sent.text,
+                        text=md_chunk,
                         reply_to=incoming.message_id if (first and thread_to_sender) else None,
                         reply= Reply(
                             user_id=incoming.sender.user_id,
@@ -425,11 +460,17 @@ class Bot:
         """Reply to a command with the system prefix. markdown=True is the
         common case; the credential/pool/billing commands pass markdown=False
         because they interpolate user-controlled display names, and Markdown
-        would let a name like *foo* break the whole send."""
-        await ctx.message.reply_text(
-            f"{self.config.system_prefix} {text}",
-            parse_mode="Markdown" if markdown else None,
-        )
+        would let a name like *foo* break the whole send.
+
+        Chunked to Telegram's 4096-char limit: an over-long reply (e.g.
+        /showprompt with a big base prompt + /sysprompt extension) would
+        otherwise raise BadRequest and -- with no error handler registered --
+        fail silently. The system prefix rides only on the first chunk."""
+        body = f"{self.config.system_prefix} {text}"
+        parse_mode = "Markdown" if markdown else None
+        chunks = [body[i:i + TELEGRAM_CHAR_LIMIT] for i in range(0, len(body), TELEGRAM_CHAR_LIMIT)] or [body]
+        for chunk in chunks:
+            await ctx.message.reply_text(chunk, parse_mode=parse_mode)
 
     def _should_write_view(self, chat_id: int, force: bool) -> bool:
         """Throttle gate for the view log. Returns True (and arms the clock) when a
@@ -462,10 +503,17 @@ class Bot:
     def _render_changelog(self) -> str:
         return "\n\n".join(f"[{e['timestamp']}] {e['text']}" for e in self._prompt_changelog)
 
-    def _build_system(self, base: str) -> str:
+    def _build_system(self, base: str, chat_id: int) -> str:
         rendered = self._render_changelog()
         changelog = rendered if rendered else "(no entries yet)"
-        return f"{base}\n\n— Changelog —\n{changelog}"
+        sections = [base, f"— Changelog —\n{changelog}"]
+        # Per-chat extension (set via /sysprompt). EXTENDS the default rather
+        # than overwriting -- appended after the changelog so it has the last
+        # word in the prompt.
+        custom = self.store.get_sys_prompt(chat_id)
+        if custom:
+            sections.append(f"— Chat-specific extension —\n{custom}")
+        return "\n\n".join(sections)
 
     def _base_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Base system prompt for this chat, without the changelog."""
@@ -488,7 +536,7 @@ class Bot:
 
     def _view_system_prompt(self, chat_id: int, snapshot: list[Message], is_private: bool, partner_id: Optional[int]) -> str:
         """Full system prompt as the model sees it (base + changelog)."""
-        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id))
+        return self._build_system(self._base_prompt(chat_id, snapshot, is_private, partner_id), chat_id)
 
     async def _write_chat_view(
         self, chat_id: int, snapshot: list[Message], display_tz: Optional[ZoneInfo],
@@ -508,14 +556,30 @@ class Bot:
         is warned about once per chat rather than on every write."""
         try:
             system = self._view_system_prompt(chat_id, snapshot, is_private, partner_id)
-            messages = render_history(snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz)
+            # embed_images=False so image blocks come back as `[image: ...]`
+            # text placeholders -- we don't want to read + base64-encode photo
+            # bytes just to dump them into a human-readable log.
+            messages = render_history(
+                snapshot, self.me, RenderMode.CHAT, self.store.resolve_user, display_tz,
+                resolve_media=None, embed_images=False,
+            )
             blocks = [f"System: {system}"]
             for mp in messages:
                 # MessageParam is a TypedDict (plain dict at runtime), not an attr object.
                 prefix = "H:" if mp["role"] == "user" else "A:"
                 content = mp["content"]
-                content = content if isinstance(content, str) else str(content)
-                blocks.append(f"{prefix} {content}")
+                if isinstance(content, str):
+                    body = content
+                else:
+                    parts = []
+                    for block in content:
+                        btype = block.get("type", "?")
+                        if btype == "text":
+                            parts.append(block.get("text", ""))
+                        else:
+                            parts.append(f"[{btype} block]")
+                    body = "".join(parts)
+                blocks.append(f"{prefix} {body}")
             text = "\n\n".join(blocks) + "\n"
             await asyncio.to_thread(self._write_view_file, self.store.view_path(chat_id), text)
             self._view_warned.discard(chat_id)
@@ -528,12 +592,134 @@ class Bot:
     @staticmethod
     def _write_view_file(path, text: str) -> None:
         """Atomic overwrite (runs in a worker thread): write to a sibling tmp file
-        then os.replace it into place."""
+        then Path.replace it into place."""
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(text)
-        os.replace(tmp, path)
+        tmp.replace(path)
+
+    async def _download_photo(self, message: telegram.Message) -> Optional[Image]:
+        """Pull the highest-resolution PhotoSize down to the chat's media dir
+        and return an Image ref (relative path + media_type). Telegram delivers
+        compressed JPEGs; we don't bother sniffing. On any failure, return None
+        so the message still gets stored as text-only — losing the picture is
+        recoverable, dropping the message wouldn't be."""
+        chat_id = message.chat_id
+        msg_id = message.message_id
+        photo = message.photo[-1]
+        if photo.file_size and photo.file_size > PHOTO_MAX_BYTES:
+            logger.warning(
+                "Photo in chat %s msg %s is %d bytes (> %d cap); skipping image attachment",
+                chat_id, msg_id, photo.file_size, PHOTO_MAX_BYTES,
+            )
+            return None
+        target = self.store.media_path(chat_id, msg_id, "jpg")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.parent / (target.name + ".part")
+        size = 0
+        try:
+            tg_file = await photo.get_file()
+            if not tg_file.file_path:
+                # file_path is optional on PTB's File; without it we have neither
+                # a local path nor a URL suffix to fetch. PTB's own
+                # download_to_drive raises here; we degrade to text-only instead.
+                logger.warning(
+                    "Photo in chat %s msg %s has no file_path; skipping image attachment",
+                    chat_id, msg_id,
+                )
+                return None
+            # When a local Bot API server is configured, Telegram hands back
+            # file_path as an absolute path to a file already on our disk, not a
+            # URL suffix; copy it straight across (this is what PTB's own
+            # download_to_drive does). The up-front photo.file_size check is
+            # best-effort (that field is optional), so re-check the actual size
+            # on disk to keep the cap honest on this path too.
+            if is_local_file(tg_file.file_path):
+                src = Path(tg_file.file_path)
+                src_size = await asyncio.to_thread(lambda: src.stat().st_size)
+                if src_size > PHOTO_MAX_BYTES:
+                    logger.warning(
+                        "Local photo for chat %s msg %s is %d bytes (> %d cap); "
+                        "skipping image attachment",
+                        chat_id, msg_id, src_size, PHOTO_MAX_BYTES,
+                    )
+                    return None
+                # Offload the synchronous read+write so we don't stall the event
+                # loop (and PTB's update dispatch) on multi-MB disk I/O, matching
+                # the asyncio.to_thread convention used by _write_view_file.
+                await asyncio.to_thread(lambda: tmp.write_bytes(src.read_bytes()))
+                size = await asyncio.to_thread(lambda: tmp.stat().st_size)
+            else:
+                # Remote Bot API: PTB's get_file() already prepended base_file_url
+                # to file_path for remote files, and File._get_encoded_url() returns
+                # that full, URL-encoded download URL (not a suffix) — the same value
+                # PTB itself passes straight to request.retrieve(). So use it as-is;
+                # re-prepending base_file_url would double the URL and 404. We stream
+                # to disk, aborting the moment the running byte count crosses
+                # PHOTO_MAX_BYTES so a giant (or file_size=None) attachment can't be
+                # fully buffered in memory. The URL carries the token.
+                url = tg_file._get_encoded_url()
+                # asyncio.timeout caps total wall-clock; the per-connect/read
+                # timeouts bound a server that stalls mid-transfer (accepts the
+                # connection but dribbles or stops sending bytes).
+                timeout = httpx.Timeout(PHOTO_DL_TIMEOUT_S, connect=10.0, read=30.0)
+                async with asyncio.timeout(PHOTO_DL_TIMEOUT_S):
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with client.stream("GET", url) as resp:
+                            resp.raise_for_status()
+                            # Open and write off-thread so per-chunk disk writes
+                            # don't block the event loop (see asyncio.to_thread note
+                            # on the local branch above).
+                            f = await asyncio.to_thread(open, tmp, "wb")
+                            try:
+                                async for chunk in resp.aiter_bytes(65536):
+                                    size += len(chunk)
+                                    if size > PHOTO_MAX_BYTES:
+                                        logger.warning(
+                                            "Photo in chat %s msg %s exceeded %d byte cap mid-stream; "
+                                            "aborting, skipping image attachment",
+                                            chat_id, msg_id, PHOTO_MAX_BYTES,
+                                        )
+                                        return None
+                                    await asyncio.to_thread(f.write, chunk)
+                            finally:
+                                await asyncio.to_thread(f.close)
+            if size == 0:
+                logger.warning(
+                    "Photo download for chat %s msg %s was empty; skipping image attachment",
+                    chat_id, msg_id,
+                )
+                return None
+            await asyncio.to_thread(tmp.replace, target)
+        except TimeoutError:
+            logger.warning("Photo download timed out for chat %s msg %s", chat_id, msg_id)
+            return None
+        except (telegram.error.TelegramError, httpx.HTTPError) as e:
+            # Type only, never the exception value — both telegram's and httpx's
+            # error reprs can carry the token-bearing file URL into the logs.
+            logger.warning("Photo download failed for chat %s msg %s: %s", chat_id, msg_id, type(e).__name__)
+            return None
+        except Exception as e:
+            # Type only, never logger.exception — a traceback can carry the
+            # token-bearing request URL into the logs.
+            logger.warning("Unexpected error downloading photo for chat %s msg %s: %s",
+                           chat_id, msg_id, type(e).__name__)
+            return None
+        finally:
+            # no-op after a successful tmp.replace. Guard it: a cleanup-time
+            # OSError (perms, read-only FS) must not propagate out of here and
+            # drop the whole inbound message — the contract is to degrade to
+            # text-only, never to crash the handler.
+            try:
+                await asyncio.to_thread(lambda: tmp.unlink(missing_ok=True))
+            except OSError as e:
+                logger.warning("Failed to clean up temp photo file for chat %s msg %s: %s",
+                               chat_id, msg_id, type(e).__name__)
+        rel = target.relative_to(self.store.data_dir).as_posix()
+        logger.info("Saved photo for chat %s msg %s to %s (%d bytes)",
+                    chat_id, msg_id, rel, size)
+        return Image(path=rel, media_type="image/jpeg")
 
     async def _drop_pasted_secret(self, message: telegram.Message) -> None:
         """Delete a message that contains an API key, refuse, and warn. Shared by
@@ -568,8 +754,9 @@ class Bot:
         if not message or not message.from_user:
             return
 
-        text = message.text or message.caption
-        if not text:
+        text = message.text or message.caption or ""
+        has_photo = bool(message.photo)
+        if not text and not has_photo:
             return
 
         # Secret guard — FIRST, in EVERY chat type, and BEFORE the is_active /
@@ -580,14 +767,14 @@ class Bot:
         # chats are just as exposed as DMs. Delete it, refuse, and raise
         # ApplicationHandlerStop so on_ping (a later handler group) never sees it
         # (a bare `return` only ends THIS handler).
-        if _looks_like_secret(text):
+        if text and _looks_like_secret(text):
             await self._drop_pasted_secret(message)
             raise ApplicationHandlerStop
 
         if not self.store.is_active(message.chat_id):
             return
 
-        if self.config.ignore_prefix and text.startswith(self.config.ignore_prefix):
+        if text and self.config.ignore_prefix and text.startswith(self.config.ignore_prefix):
             logger.debug("Skipping ignored message (prefix=%r) in chat %s", self.config.ignore_prefix, message.chat_id)
             return
 
@@ -612,6 +799,8 @@ class Bot:
                            message.chat_id, exc_info=True)
             forward = None
 
+        image = await self._download_photo(message) if has_photo else None
+
         msg = Message(
             id=message.message_id,
             ts=message.date,
@@ -620,6 +809,7 @@ class Bot:
             reply_to=replied.message_id if replied else None,
             reply=reply,
             forward=forward,
+            image=image,
         )
 
         async with self.store.lock(message.chat_id):
@@ -816,11 +1006,12 @@ class Bot:
         thread_to_sender = len(senders) <= 1
         reply_to_id = incoming.message_id if thread_to_sender else None
 
-        async def reply(text: str) -> Optional[telegram.Message]:
+        async def reply(text: str, parse_mode: Optional[str] = None) -> Optional[telegram.Message]:
             return await bot.send_message(
                 chat_id=incoming.chat_id,
                 text=text,
                 reply_to_message_id=reply_to_id,
+                parse_mode=parse_mode,
             )
 
         prompt_mode = PromptMode.CHAT_PRIVATE if incoming.is_private else PromptMode.CHAT
@@ -895,11 +1086,11 @@ class Bot:
             bot_info=self.me,
             partner=partner,
             tz_directory=tz_directory
-        ))
+        ), incoming.chat_id)
 
         messages = render_history(
             snapshot, self.me, render_mode, self.store.resolve_user, display_tz,
-            for_completion=True,
+            for_completion=True, resolve_media=self.store.resolve_media, embed_images=True
         )
         if not messages:
             logger.info(
@@ -975,8 +1166,12 @@ class Bot:
         if prior_failures:
             await self._notify_admins_recovered(incoming.chat_id, prior_failures)
 
-        if not completion.text:
-            logger.warning("Model returned empty reply for chat %s", incoming.chat_id)
+        # `.strip()` not just truthiness: a whitespace-only reply ("\n\n") is
+        # truthy but chunk_markdown drops it to zero chunks, so _send would
+        # silently send nothing and persist a "completed" turn. Treat it as
+        # empty here so the user isn't left in silence.
+        if not completion.text.strip():
+            logger.warning("Model returned empty/blank reply for chat %s", incoming.chat_id)
             return
 
         await self._send(reply, incoming, completion.text, incarnation, display_tz, thread_to_sender)
@@ -1311,6 +1506,7 @@ class Bot:
             "`/reset`: wipe this chat's history",
             "`/save`: back up unsaved messages to disk",
             f"`/model [name]`: show or set the model for this chat{admin_note}",
+            f"`/sysprompt [text]`: extend the default system prompt for this chat (no args clears){admin_note}",
             f"`/load`: replace this chat's history with a Telegram Desktop `result.json`{admin_note}",
             "`/tz [name]`: show or set your timezone (IANA name, e.g. `America/New_York`)",
             "`/whoami`: show your telegram user id",
@@ -1372,6 +1568,45 @@ class Bot:
             chat_id, resolved, ctx.user.id,
         )
         await self._say(ctx, f"Set to `{resolved}` for this chat")
+
+    @command(admin="in_groups")
+    async def command_sysprompt(self, ctx: CommandCtx):
+        """Set / clear a per-chat addition to the system prompt.
+
+        The custom text is APPENDED to the default base prompt (after the
+        changelog) -- it extends, not replaces. With no args, the custom is
+        cleared and we fall back to the pure default."""
+        chat_id = ctx.chat_id
+        # PTB splits args by whitespace; rejoin so multi-word prompts come
+        # through intact.
+        text = " ".join(ctx.args).strip()
+
+        if not text:
+            had = self.store.clear_sys_prompt(chat_id)
+            if had:
+                await self._say(ctx, "Cleared chat-specific extension. Reverted to the default sysprompt.", markdown=False)
+            else:
+                await self._say(ctx, "No chat-specific extension was set.", markdown=False)
+            return
+
+        # on_message's secret guard never sees this message: on_message is
+        # registered with `~filters.COMMAND` (so `/sysprompt …` is excluded from
+        # it entirely), which is exactly why we must re-check here. Without this
+        # guard a pasted key would be written verbatim into the per-chat config
+        # and rendered into every subsequent prompt. Drop + refuse.
+        if _looks_like_secret(text):
+            await self._drop_pasted_secret(ctx.message)
+            return
+
+        self.store.set_sys_prompt(chat_id, text)
+        logger.info(
+            "Set sys prompt for chat %s to %d chars by user_id=%s",
+            chat_id, len(text), ctx.user.id,
+        )
+        await self._say(
+            ctx,
+            f"Set chat extension ({len(text)} chars). Use `/sysprompt` (no args) to clear; `/showprompt` to see the full prompt.",
+        )
 
     # ---- credential / pool / billing commands --------------------------
     # These interpolate user-controlled display names, so they send plain text
@@ -1497,19 +1732,21 @@ class Bot:
         lines += [f"- {self.store.resolve_user(uid).display_name} (id {uid})" for uid in ids]
         await self._say(ctx, "\n".join(lines), markdown=False)
 
-    @command(admin="always")
+    # Gated the same as /sysprompt (admin="in_groups", not "always"): anyone who
+    # can SET a chat extension must be able to view the result it produces,
+    # otherwise the /sysprompt success message points DM users at a command that
+    # silently denies them.
+    @command(admin="in_groups")
     async def command_showprompt(self, ctx: CommandCtx):
         window = self.store.window(ctx.chat_id)
-        base = self._base_prompt(
+        # Route through _view_system_prompt so this shows the FULL prompt the
+        # model receives -- base + changelog + any per-chat /sysprompt extension.
+        # Assembling it by hand here previously omitted the extension.
+        full = self._view_system_prompt(
             ctx.chat_id, window.snapshot(), ctx.is_private,
             ctx.user.id if ctx.is_private else None,
         )
-        rendered = self._render_changelog()
-        if rendered:
-            changelog_section = f"\n\n— Changelog —\n{rendered}"
-        else:
-            changelog_section = "\n\n— Changelog —\n(no entries yet)"
-        await self._say(ctx, base + changelog_section, markdown=False)
+        await self._say(ctx, full, markdown=False)
 
     @command(admin="always")
     async def command_appendprompt(self, ctx: CommandCtx):
@@ -1619,6 +1856,7 @@ class Bot:
         self.application.add_handler(CommandHandler("whoami", self.command_whoami), group=0)
         self.application.add_handler(CommandHandler("save", self.command_save), group=0)
         self.application.add_handler(CommandHandler("model", self.command_model), group=0)
+        self.application.add_handler(CommandHandler("sysprompt", self.command_sysprompt), group=0)
         self.application.add_handler(CommandHandler("tz", self.command_tz), group=0)
         self.application.add_handler(CommandHandler("help", self.command_help), group=0)
         self.application.add_handler(CommandHandler("setkey", self.command_setkey), group=0)
@@ -1650,9 +1888,12 @@ class Bot:
         # caption equivalent (filters.COMMAND ignores caption_entities), so a
         # `/load`-captioned upload — already handled by command_load in group 0 —
         # doesn't also fall through here and get stored as the literal "/load".
+        # filters.PHOTO covers bare-photo messages (no caption) so they reach
+        # on_message; a photo with caption is already matched via CAPTION, and a
+        # photo with /command caption is still excluded by CaptionCommand.
         # Shared by on_message (group 1) and on_ping (group 2): neither should
         # see a caption-command.
-        text_or_caption = (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & ~CaptionCommand()
+        text_or_caption = (filters.TEXT | filters.CAPTION | filters.PHOTO) & ~filters.COMMAND & ~CaptionCommand()
         self.application.add_handler(MessageHandler(text_or_caption, self.on_message), group=1)
 
         # on_ping gating is fully declarative: the chat must be active, the

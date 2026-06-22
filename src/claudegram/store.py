@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -19,13 +20,16 @@ logger = logging.getLogger(__name__)
 
 class Store:
     def __init__(self, data_dir: PathLike, log_dir: PathLike, input_budget: int):
-        self.data_dir = Path(data_dir)
-        self.log_dir = Path(log_dir)
+        self.data_dir = Path(data_dir).resolve()
+        self.log_dir = Path(log_dir).resolve()
         self.input_budget = input_budget
         self.windows: dict[int, Window] = {}
 
         self._model_prefs: dict[int, Model] = {}
         self._load_model_prefs()
+
+        self._sys_prompts: dict[int, str] = {}
+        self._load_sys_prompts()
 
         self._active_chats: set[int] = set()
         self._load_active_chats()
@@ -68,6 +72,21 @@ class Store:
 
     def context_path(self, chat_id: int) -> Path:
         return self.log_dir / f"chat_{chat_id}.context.log"
+
+    def media_dir(self, chat_id: int) -> Path:
+        return self.data_dir / "media" / f"chat_{chat_id}"
+
+    def media_path(self, chat_id: int, message_id: int, ext: str) -> Path:
+        """Absolute path for a message's media file. `ext` is the extension
+        without leading dot (e.g. 'jpg'). Callers store the path relative to
+        data_dir in the Message; resolve_media flips it back to absolute."""
+        return self.media_dir(chat_id) / f"{message_id}.{ext}"
+
+    def resolve_media(self, relative_path: str) -> Path:
+        target = (self.data_dir / relative_path).resolve()
+        if Path(relative_path).is_absolute() or not target.is_relative_to(self.data_dir):
+            raise ValueError(f"media path escapes data dir: {relative_path!r}")
+        return target
 
     @property
     def model_prefs_path(self) -> Path:
@@ -118,6 +137,60 @@ class Store:
         tmp = path.with_suffix(path.suffix + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({str(k): v.value for k, v in self._model_prefs.items()}, f, indent=2)
+        tmp.replace(path)
+
+    @property
+    def sys_prompts_path(self) -> Path:
+        return self.data_dir / "sys_prompts.json"
+
+    def get_sys_prompt(self, chat_id: int) -> Optional[str]:
+        return self._sys_prompts.get(chat_id)
+
+    def set_sys_prompt(self, chat_id: int, text: str) -> None:
+        self._sys_prompts[chat_id] = text
+        self._save_sys_prompts()
+        logger.info("Set sys prompt for chat %s (%d chars)", chat_id, len(text))
+
+    def clear_sys_prompt(self, chat_id: int) -> bool:
+        had = chat_id in self._sys_prompts
+        self._sys_prompts.pop(chat_id, None)
+        if had:
+            self._save_sys_prompts()
+            logger.info("Cleared sys prompt for chat %s", chat_id)
+        return had
+
+    def _load_sys_prompts(self) -> None:
+        path = self.sys_prompts_path
+        if not path.exists():
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as e:
+            logger.error("Failed to load sys prompts from %s: %s — starting fresh", path, e, exc_info=True)
+            self._sys_prompts = {}
+            return
+        if not isinstance(raw, dict):
+            logger.error("sys prompts file %s is not a JSON object (got %s); ignoring",
+                         path, type(raw).__name__)
+            return
+        parsed: dict[int, str] = {}
+        for k, v in raw.items():
+            try:
+                if not isinstance(v, str) or not v:
+                    raise TypeError(f"expected non-empty string, got {type(v).__name__}")
+                parsed[int(k)] = v
+            except (ValueError, TypeError) as e:
+                logger.warning("Dropping invalid sys prompt for chat %s: %r (%s)", k, v, e)
+        self._sys_prompts = parsed
+        logger.info("Loaded %d sys prompt(s) from %s", len(self._sys_prompts), path)
+
+    def _save_sys_prompts(self) -> None:
+        path = self.sys_prompts_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in self._sys_prompts.items()}, f, indent=2)
         tmp.replace(path)
 
     @property
@@ -387,6 +460,14 @@ class Store:
         os.replace(tmp, path)
         logger.info("Replaced chat %s history with %d message(s)", chat_id, len(messages))
 
+        # The replaced history references new message ids; the old per-message
+        # image files keyed on the OLD ids are now orphans. /load doesn't emit
+        # images yet (see TODO), so the imported set has nothing to preserve.
+        media = self.media_dir(chat_id)
+        if media.exists():
+            shutil.rmtree(media, ignore_errors=True)
+            logger.info("Cleared media dir (%s) for chat %s on replace", media, chat_id)
+
         self.windows.pop(chat_id, None)
         self._incarnation[chat_id] = self._incarnation.get(chat_id, 0) + 1
         return backup
@@ -415,5 +496,10 @@ class Store:
         if view_path.exists():
             view_path.unlink()
             logger.info("Deleted chat view log (%s) for chat %s", view_path, chat_id)
+
+        media = self.media_dir(chat_id)
+        if media.exists():
+            shutil.rmtree(media, ignore_errors=True)
+            logger.info("Deleted media dir (%s) for chat %s", media, chat_id)
 
         return (deleted_window, chat_exists, ctx_exists)

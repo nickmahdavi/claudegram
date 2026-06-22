@@ -1,16 +1,25 @@
+import base64
+import logging
 from datetime import date, datetime
 from enum import StrEnum
 from itertools import groupby
+from pathlib import Path
 from typing import Callable, Literal, Optional, cast
 from zoneinfo import ZoneInfo
 
-from anthropic.types import MessageParam
+from anthropic.types import (
+    ImageBlockParam,
+    MessageParam,
+    TextBlockParam,
+)
 
 from .identity import UserInfo
-from .message import UTC, Forward, Message, Reply
+from .message import UTC, Forward, Image, Message, Reply
 
+logger = logging.getLogger(__name__)
 
 Resolver = Callable[[int], UserInfo]
+MediaResolver = Callable[[str], Path]
 
 class RenderMode(StrEnum):
     """How a list of Messages is shaped into SDK message turns.
@@ -111,12 +120,37 @@ def get_datemark(message: Message, resolve: Resolver, last_emitted_date: Optiona
         return (f"--- {message_date.isoformat()} ---\n\n", message_date)
     return ("", last_emitted_date)
 
+def _load_image_block(image: Image, resolve_media: MediaResolver) -> Optional[ImageBlockParam]:
+    """Read image bytes from disk and wrap them as an Anthropic ImageBlockParam.
+    Returns None on any IO/encoding failure so the caller can fall back to a
+    text placeholder rather than crash the whole render."""
+    try:
+        data = resolve_media(image.path).read_bytes()
+    except Exception as e:
+        logger.warning("Failed to read image %s: %s", image.path, e)
+        return None
+    return ImageBlockParam(
+        type="image",
+        source={
+            "type": "base64",
+            "media_type": image.media_type,  # type: ignore[typeddict-item]
+            "data": base64.standard_b64encode(data).decode("ascii"),
+        },
+    )
+
+
+def _image_placeholder(image: Image) -> str:
+    return f"[image: {image.media_type}]"
+
+
 def render_history(
     messages: list[Message],
     bot_info: UserInfo,
     mode: RenderMode,
     resolve: Resolver,
     display_tz: Optional[ZoneInfo] = None,
+    resolve_media: Optional[MediaResolver] = None,
+    embed_images: bool = True,
     *,
     for_completion: bool = False,
 ) -> list[MessageParam]:
@@ -155,7 +189,9 @@ def render_history(
             while hist and hist[0].user_id == bot_info.user_id:
                 hist.pop(0)
 
-        rendered: list[tuple[Literal["user", "assistant"], str]] = []
+        # Per message: (role, rendered_text, image-or-None). Bot messages never
+        # carry an image; only the user side has one.
+        rendered: list[tuple[Literal["user", "assistant"], str, Optional[Image]]] = []
         last_emitted_date = None
         for msg in hist:
             is_assistant = msg.user_id == bot_info.user_id
@@ -163,13 +199,44 @@ def render_history(
             if not is_assistant:
                 datemark, last_emitted_date = get_datemark(msg, resolve, last_emitted_date, display_tz)
                 body = f"{datemark}{body}"
-            rendered.append(("assistant" if is_assistant else "user", body))
+            role: Literal["user", "assistant"] = "assistant" if is_assistant else "user"
+            img = None if is_assistant else msg.image
+            rendered.append((role, body, img))
 
         result: list[MessageParam] = []
         for role, group in groupby(rendered, key=lambda x: x[0]):
-            chunks = [text for _, text in group]
-            content = "".join(chunks) if role == "assistant" else "\n\n".join(chunks)
-            result.append(MessageParam(role=cast(Literal["user", "assistant"], role), content=content))
+            items = list(group)
+            # Fast path -- no images in this user-role group (and assistant
+            # groups never have any): join into a single string content so the
+            # cache prefix stays byte-stable.
+            if role == "assistant" or not any(img for _, _, img in items):
+                chunks = [text for _, text, _ in items]
+                content = "".join(chunks) if role == "assistant" else "\n\n".join(chunks)
+                result.append(MessageParam(
+                    role=cast(Literal["user", "assistant"], role),
+                    content=content,
+                ))
+                continue
+
+            blocks: list[TextBlockParam | ImageBlockParam] = []
+            for i, (_, body_text, img) in enumerate(items):
+                # render_message always emits at least the tag line, so body_text
+                # is non-empty for user turns. Carry the inter-message "\n\n"
+                # gap as a prefix on each subsequent text block so the visible
+                # shape matches the join-on-"\n\n" path.
+                body = ("\n\n" if i > 0 else "") + body_text
+                blocks.append(TextBlockParam(type="text", text=body))
+                if img is not None:
+                    block: Optional[TextBlockParam | ImageBlockParam] = None
+                    if embed_images and resolve_media is not None:
+                        block = _load_image_block(img, resolve_media)
+                    if block is None:
+                        block = TextBlockParam(type="text", text=_image_placeholder(img))
+                    blocks.append(block)
+            result.append(MessageParam(
+                role=cast(Literal["user", "assistant"], role),
+                content=blocks,
+            ))
         return result
 
     if mode == RenderMode.PREFILL:
