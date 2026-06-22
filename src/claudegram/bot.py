@@ -1297,6 +1297,13 @@ class Bot:
     @command(admin="in_groups")
     async def command_stop(self, ctx: CommandCtx):
         if self.store.set_active(ctx.chat_id, False):
+            # Drop any in-flight debounce: going silent should also discard a
+            # ping queued before the /stop. Otherwise a /stop+/start within the
+            # debounce window would let the runner wake, see the chat active
+            # again, and answer the pre-stop ping. Mirrors /reset and /load --
+            # a state change drops the stale queue rather than leaning on the
+            # soft is_active re-check in _run_completion.
+            self._drop_debounce(ctx.chat_id)
             await self._say(ctx, "Going silent. `/start` to re-enable.")
             logger.info("Deactivated chat %s by user_id=%s", ctx.chat_id, ctx.user.id)
         else:
