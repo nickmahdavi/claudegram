@@ -103,6 +103,14 @@ def get_prompt(
 
 _EPHEMERAL: CacheControlEphemeralParam = {"type": "ephemeral", "ttl": "1h"}
 
+# Map server-side tool types to the anthropic-beta header they require. Add a
+# new entry here when you wire a new beta-only tool into bot.SERVER_TOOLS.
+_TOOL_BETAS: dict[str, str] = {
+    "web_fetch_20250910": "web-fetch-2025-09-10",
+    "code_execution_20250522": "code-execution-2025-05-22",  # legacy (Python-only)
+    "code_execution_20250825": "code-execution-2025-08-25",  # current v2 (Python + bash + files)
+}
+
 
 def _mark_last_message_for_cache(messages: list[MessageParam]) -> list[MessageParam]:
     """Return a shallow copy of `messages` with cache_control marked on the
@@ -141,6 +149,7 @@ async def complete(
     messages: list[MessageParam],
     max_tokens: int,
     mcp_servers: Optional[list[dict]] = None,
+    tools: Optional[list[dict]] = None,
 ) -> ClaudeResponse:
     # Two explicit cache breakpoints, used together:
     #   1. End of the system prompt: small always-on cache. Survives Window
@@ -159,25 +168,42 @@ async def complete(
     ]
     cached_messages = _mark_last_message_for_cache(messages)
 
+    # Beta flags + endpoint selection. MCP and several server-side tools each
+    # require their own opt-in header; web_search is GA but the beta endpoint
+    # accepts it the same as the standard endpoint, so we collapse the routing
+    # here. Adding a new server-tool means adding the (tool_type -> beta_header)
+    # entry below and the tool dict in bot.SERVER_TOOLS.
+    betas: list[str] = []
     if mcp_servers:
-        response = await client.beta.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-            mcp_servers=mcp_servers,  # type: ignore[arg-type]
-            betas=["mcp-client-2025-04-04"],
-        )
+        betas.append("mcp-client-2025-04-04")
+    for tool in tools or []:
+        beta = _TOOL_BETAS.get(tool.get("type", ""))
+        if beta and beta not in betas:
+            betas.append(beta)
+
+    kwargs: dict = dict(
+        model=model,
+        system=system_blocks,
+        messages=cached_messages,
+        max_tokens=max_tokens,
+    )
+    if tools:
+        kwargs["tools"] = tools
+    if mcp_servers:
+        kwargs["mcp_servers"] = mcp_servers  # type: ignore[arg-type]
+
+    if betas:
+        response = await client.beta.messages.create(**kwargs, betas=betas)
     else:
-        response = await client.messages.create(
-            model=model,
-            system=system_blocks,
-            messages=cached_messages,
-            max_tokens=max_tokens,
-        )
+        response = await client.messages.create(**kwargs)
 
     text_parts = [b.text for b in response.content if hasattr(b, "text") and b.type == "text"]
-    text = "".join(text_parts)
+    # Tool-use responses interleave text and tool_use blocks. Joining text
+    # parts with "" smashes the pre-tool announcement ("On it!") into the
+    # post-tool synthesis ("Now let me search..."). Paragraph break preserves
+    # the natural beat the model intends between segments; single-text-block
+    # responses are unaffected.
+    text = "\n\n".join(p.rstrip() for p in text_parts if p.strip())
     block_types = [getattr(b, "type", "?") for b in response.content]
     usage = response.usage
 

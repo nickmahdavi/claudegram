@@ -74,6 +74,17 @@ PHOTO_MAX_BYTES = 7 * 1024 * 1024
 # slow-drip server can't hold the coroutine open indefinitely, regardless of
 # httpx's per-read timeouts.
 PHOTO_DL_TIMEOUT_S = 72
+# Anthropic server-side tools sent on every completion. The model decides
+# whether to invoke them based on the prompt; max_uses caps cost per turn
+# for the web ones (code_execution is session-based, no max_uses field).
+# Each beta-only tool is gated on a header that model.complete picks up
+# via _TOOL_BETAS. Citations on fetched pages come back embedded in the
+# model's text so no extra rendering is needed.
+SERVER_TOOLS: list[dict] = [
+    {"type": "web_search_20250305", "name": "web_search", "max_uses": 3},
+    {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 3, "citations": {"enabled": True}},
+    {"type": "code_execution_20250825", "name": "code_execution"},
+]
 # Coalesce per-chat view-log rewrites to at most one per this interval. A busy
 # group otherwise re-renders the whole window + writes a file on every message;
 # the bot only actually "sees" history at ping time, which forces a write anyway.
@@ -1119,6 +1130,7 @@ class Bot:
                     messages=messages,
                     max_tokens=self.config.reply_budget,
                     mcp_servers=mcp_servers,
+                    tools=SERVER_TOOLS,
                 )
             except TRANSIENT_ERRORS as exc:
                 if mcp_servers is None:
@@ -1137,6 +1149,7 @@ class Bot:
                         messages=messages,
                         max_tokens=self.config.reply_budget,
                         mcp_servers=None,
+                        tools=SERVER_TOOLS,
                     )
                 except Exception as fallback_exc:
                     await self._handle_completion_error(incoming, reply, fallback_exc, cred)
