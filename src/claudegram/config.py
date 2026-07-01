@@ -29,6 +29,8 @@ class Config(BaseSettings):
     mcp_server_name: str | None = None   # name passed to the Anthropic API
     mcp_client_id: str | None = None
     mcp_client_secret: str | None = None
+    # Chats allowed to use MCP tool access. Empty means no chats get access.
+    mcp_allowed_chat_ids: Annotated[frozenset[int], NoDecode] = Field(default_factory=frozenset)
 
     @property
     def mcp_enabled(self) -> bool:
@@ -42,6 +44,13 @@ class Config(BaseSettings):
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def _parse_admins(cls, v):
+        if isinstance(v, str):
+            return frozenset(int(x) for x in v.split(",") if x.strip())
+        return v
+
+    @field_validator("mcp_allowed_chat_ids", mode="before")
+    @classmethod
+    def _parse_mcp_chat_ids(cls, v):
         if isinstance(v, str):
             return frozenset(int(x) for x in v.split(",") if x.strip())
         return v
