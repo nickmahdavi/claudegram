@@ -1100,7 +1100,7 @@ class Bot:
             return
 
         mcp_servers = None
-        if self.mcp_tokens is not None:
+        if self.mcp_tokens is not None and incoming.chat_id in self.config.mcp_allowed_chat_ids:
             token = await self.mcp_tokens.get_token()
             if token is not None:
                 mcp_servers = [{
